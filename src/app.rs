@@ -26,6 +26,8 @@ pub enum PendingAction {
     EraseQuick,
     EraseSecure,
     WriteIso { path: PathBuf, size: u64 },
+    BenchFull,
+    Capacity { full: bool },
 }
 
 impl PendingAction {
@@ -37,6 +39,9 @@ impl PendingAction {
             PendingAction::EraseQuick => format!("Erasing disk {disk} (quick)"),
             PendingAction::EraseSecure => format!("Erasing disk {disk} (zero-fill)"),
             PendingAction::WriteIso { .. } => format!("Writing image to disk {disk}"),
+            PendingAction::BenchFull => format!("Benchmarking disk {disk} (read + write)"),
+            PendingAction::Capacity { full: false } => format!("Capacity test on disk {disk} (quick)"),
+            PendingAction::Capacity { full: true } => format!("Capacity test on disk {disk} (full)"),
         }
     }
 
@@ -53,15 +58,24 @@ impl PendingAction {
                 "Secure erase — overwrite EVERY byte on the disk with zeros".into()
             }
             PendingAction::WriteIso { path, size } => format!(
-                "Write image '{}' ({}) sector-by-sector",
+                "Write image '{}' ({}) sector-by-sector, then verify",
                 path.file_name().and_then(|f| f.to_str()).unwrap_or("?"),
                 disks::human(*size)
             ),
+            PendingAction::BenchFull => {
+                "Full benchmark — wipes the disk, then measures seq/4K read & write".into()
+            }
+            PendingAction::Capacity { full: false } => {
+                "Quick capacity test — wipes the disk, writes & verifies pattern samples".into()
+            }
+            PendingAction::Capacity { full: true } => {
+                "FULL capacity test — wipes the disk, writes & verifies EVERY byte (hours)".into()
+            }
         }
     }
 
     fn cancellable(&self) -> bool {
-        matches!(self, PendingAction::EraseSecure | PendingAction::WriteIso { .. })
+        !matches!(self, PendingAction::Format { .. } | PendingAction::EraseQuick)
     }
 }
 
@@ -69,6 +83,7 @@ pub struct ProgressState {
     pub title: String,
     pub pct: Option<f64>,
     pub detail: String,
+    pub samples: Vec<u64>,
     pub logs: Vec<String>,
     pub started: Instant,
     pub done: Option<Result<String, String>>,
@@ -82,6 +97,7 @@ pub enum Modal {
     Unlock { buf: String },
     Presets { idx: usize },
     EraseMenu { idx: usize },
+    TestMenu { idx: usize },
     Input { purpose: InputPurpose, buf: String },
     Confirm { action: PendingAction, buf: String },
     Progress(ProgressState),
@@ -181,6 +197,12 @@ impl App {
                         OpEvent::Progress(frac, detail) => {
                             p.pct = Some(frac);
                             p.detail = detail;
+                        }
+                        OpEvent::Sample(v) => {
+                            p.samples.push(v);
+                            if p.samples.len() > 240 {
+                                p.samples.remove(0);
+                            }
                         }
                         OpEvent::Done(r) => {
                             match &r {
@@ -360,6 +382,31 @@ impl App {
                 }
                 _ => self.modal = Modal::EraseMenu { idx },
             },
+            Modal::TestMenu { mut idx } => match k.code {
+                KeyCode::Esc => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    idx = (idx + 3) % 4;
+                    self.modal = Modal::TestMenu { idx };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    idx = (idx + 1) % 4;
+                    self.modal = Modal::TestMenu { idx };
+                }
+                KeyCode::Enter => match idx {
+                    0 => self.start_read_bench(),
+                    _ => {
+                        if self.guard() {
+                            let action = match idx {
+                                1 => PendingAction::BenchFull,
+                                2 => PendingAction::Capacity { full: false },
+                                _ => PendingAction::Capacity { full: true },
+                            };
+                            self.modal = Modal::Confirm { action, buf: String::new() };
+                        }
+                    }
+                },
+                _ => self.modal = Modal::TestMenu { idx },
+            },
             Modal::Input { purpose, mut buf } => match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Backspace => {
@@ -483,6 +530,13 @@ impl App {
                         buf: String::new(),
                     };
                 }
+            KeyCode::Char('b') => {
+                if self.selected_disk().is_some() {
+                    self.modal = Modal::TestMenu { idx: 0 };
+                } else {
+                    self.error("no disk selected");
+                }
+            }
             _ => {}
         }
     }
@@ -547,6 +601,7 @@ impl App {
             title: action.title(disk.number),
             pct: None,
             detail: String::new(),
+            samples: Vec::new(),
             logs: vec![format!(
                 "Target: disk {} · {} · {}",
                 disk.number,
@@ -568,7 +623,51 @@ impl App {
             PendingAction::WriteIso { path, size } => {
                 ops::spawn_write_iso(tx, disk, path, size, cancel, allow_protected)
             }
+            PendingAction::BenchFull => {
+                crate::bench::spawn_full_bench(tx, disk, cancel, allow_protected)
+            }
+            PendingAction::Capacity { full } => {
+                crate::bench::spawn_capacity_test(tx, disk, full, cancel, allow_protected)
+            }
         }
+        self.modal = Modal::Progress(progress);
+    }
+
+    /// Read benchmark is non-destructive, so it skips the confirm dialog and
+    /// is allowed even on protected disks — it only needs elevation.
+    fn start_read_bench(&mut self) {
+        if !self.elevated {
+            self.error("administrator rights required — restart this app from an elevated terminal");
+            return;
+        }
+        let Some(disk) = self.selected_disk().cloned() else {
+            self.error("no disk selected");
+            return;
+        };
+        logger::log(format!(
+            "action start: read benchmark — target disk {} · {} · {}",
+            disk.number,
+            disk.name,
+            disks::human(disk.size)
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = ProgressState {
+            title: format!("Read benchmark — disk {}", disk.number),
+            pct: None,
+            detail: String::new(),
+            samples: Vec::new(),
+            logs: vec![format!(
+                "Target: disk {} · {} · {}",
+                disk.number,
+                disk.name,
+                disks::human(disk.size)
+            )],
+            started: Instant::now(),
+            done: None,
+            cancel: cancel.clone(),
+            cancellable: true,
+        };
+        crate::bench::spawn_read_bench(self.tx.clone(), disk, cancel);
         self.modal = Modal::Progress(progress);
     }
 }

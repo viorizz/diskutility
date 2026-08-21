@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, InputPurpose, Modal, PendingAction, ProgressState};
@@ -42,6 +42,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::Unlock { buf } => draw_unlock(f, area, buf),
         Modal::Presets { idx } => draw_presets(f, area, *idx),
         Modal::EraseMenu { idx } => draw_erase_menu(f, area, *idx),
+        Modal::TestMenu { idx } => draw_test_menu(f, area, *idx),
         Modal::Input { purpose, buf } => draw_input(f, area, purpose, buf),
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
         Modal::Progress(p) => draw_progress(f, area, app, p),
@@ -294,6 +295,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         txt(" erase · "),
         key("i"),
         txt(" write image · "),
+        key("b"),
+        txt(" test · "),
         key("r"),
         txt(" rescan · "),
         key("c"),
@@ -366,6 +369,42 @@ fn draw_presets(f: &mut Frame, area: Rect, idx: usize) {
             .wrap(Wrap { trim: true }),
         rows[1],
     );
+}
+
+fn draw_test_menu(f: &mut Frame, area: Rect, idx: usize) {
+    let inner = modal_block(f, area, 72, 14, "Test disk", ACCENT);
+    let opts: [(&str, &str); 4] = [
+        (
+            "Read benchmark  (safe)",
+            "Sequential + random 4K read speed with a live graph. Non-destructive — safe on any disk, even the system disk. Starts immediately.",
+        ),
+        (
+            "Full benchmark  (DESTROYS DATA)",
+            "Sequential and random 4K read AND write speeds. The disk is wiped first and left blank afterwards.",
+        ),
+        (
+            "Capacity test — quick  (DESTROYS DATA)",
+            "Writes ~256 pattern samples across the whole address space and verifies them. Catches counterfeit 'fake capacity' drives in minutes.",
+        ),
+        (
+            "Capacity test — full  (DESTROYS DATA)",
+            "h2testw-style: writes and verifies EVERY byte. Definitive proof of real capacity and surface health, but takes hours on large disks.",
+        ),
+    ];
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (name, _)) in opts.iter().enumerate() {
+        let selected = i == idx;
+        let marker = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::new().fg(ACCENT_SOFT).bg(SEL_BG).bold()
+        } else {
+            Style::new().fg(TEXT)
+        };
+        lines.push(Line::from(Span::styled(format!("{marker}{name}"), style)));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(opts[idx].1, Style::new().fg(DIM))));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn draw_erase_menu(f: &mut Frame, area: Rect, idx: usize) {
@@ -509,11 +548,23 @@ fn draw_progress(f: &mut Frame, area: Rect, app: &App, p: &ProgressState) {
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Min(2),
         Constraint::Length(1),
     ])
     .split(inner);
+
+    // live speed graph (populated by benchmark & raw-write operations)
+    if !p.samples.is_empty() && p.done.is_none() {
+        let width = rows[2].width as usize;
+        let tail = &p.samples[p.samples.len().saturating_sub(width)..];
+        f.render_widget(
+            Sparkline::default()
+                .data(tail)
+                .style(Style::new().fg(ACCENT_SOFT)),
+            rows[2],
+        );
+    }
 
     // progress row
     match (&p.done, p.pct) {
@@ -604,7 +655,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("↑↓ / jk", "select a disk"),
         key("f", "format — Windows, macOS, Linux, PS5 or Universal preset"),
         key("e", "erase — quick (partition table) or secure (zero-fill)"),
-        key("i", "write a bootable .iso/.img image to the disk"),
+        key("i", "write a bootable .iso/.img image to the disk (verified)"),
+        key("b", "benchmark & capacity tests (read-only or destructive)"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),
         key("u", "toggle safety override — allow protected disks (DANGEROUS)"),

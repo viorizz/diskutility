@@ -23,6 +23,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 pub enum OpEvent {
     Log(String),
     Progress(f64, String),
+    Sample(u64),
     Done(Result<String, String>),
 }
 
@@ -280,7 +281,7 @@ Write-Output 'prep: disk ready (RAW, writable, online)'
 }
 
 /// Run the prep script and mirror its narration lines into the UI log.
-fn run_prep(tx: &Sender<AppEvent>, n: u32, allow_protected: bool) -> Result<(), String> {
+pub fn run_prep(tx: &Sender<AppEvent>, n: u32, allow_protected: bool) -> Result<(), String> {
     let out = run_ps(&prep_prelude(n, allow_protected))?;
     for l in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
         log(tx, l.to_string());
@@ -549,8 +550,50 @@ pub fn spawn_write_iso(
             }
             dev.sync_all().map_err(|e| format!("flush failed: {e}"))?;
             progress(&tx, image_size, image_size, start);
+            drop(dev);
+
+            // read everything back through an uncached handle and compare
+            log(&tx, "Verifying — reading the written data back from the disk…");
+            let mut src = File::open(&path).map_err(|e| format!("cannot reopen image: {e}"))?;
+            let mut dev = crate::bench::open_direct(disk.number, false)?;
+            let mut want_buf = vec![0u8; CHUNK];
+            let mut disk_buf = crate::bench::AlignedBuf::new(CHUNK);
+            let vstart = Instant::now();
+            let mut last = Instant::now();
+            let mut checked = 0u64;
+            while checked < image_size {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled during verification — the image itself was fully written".into());
+                }
+                let want = (image_size - checked).min(CHUNK as u64) as usize;
+                src.read_exact(&mut want_buf[..want])
+                    .map_err(|e| format!("image re-read failed at {}: {e}", human(checked)))?;
+                let mut aligned = want.div_ceil(4096) * 4096;
+                if checked + aligned as u64 > disk.size {
+                    aligned = want.div_ceil(512) * 512;
+                }
+                dev.read_exact(&mut disk_buf.as_mut()[..aligned])
+                    .map_err(|e| format!("disk read-back failed at {}: {e}", human(checked)))?;
+                if disk_buf.as_ref()[..want] != want_buf[..want] {
+                    let pos = disk_buf.as_ref()[..want]
+                        .iter()
+                        .zip(&want_buf[..want])
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0) as u64;
+                    return Err(format!(
+                        "VERIFICATION FAILED at offset {} — the disk does not match the image. The drive may be faulty; retry or test it (b).",
+                        human(checked + pos)
+                    ));
+                }
+                checked += want as u64;
+                if last.elapsed() >= Duration::from_millis(250) {
+                    progress_with(&tx, checked, image_size, vstart, "verify");
+                    last = Instant::now();
+                }
+            }
+            log(&tx, "Verification passed — the disk matches the image bit-for-bit.");
             Ok(format!(
-                "Image written to disk {} in {}. If Windows prompts to format new partitions, cancel those prompts.",
+                "Image written to disk {} and verified bit-for-bit in {}. If Windows prompts to format new partitions, cancel those prompts.",
                 disk.number,
                 fmt_secs(start.elapsed().as_secs_f64())
             ))
@@ -575,17 +618,23 @@ fn open_physical(n: u32) -> Result<File, String> {
 }
 
 fn progress(tx: &Sender<AppEvent>, done_bytes: u64, total: u64, start: Instant) {
+    progress_with(tx, done_bytes, total, start, "");
+}
+
+pub fn progress_with(tx: &Sender<AppEvent>, done_bytes: u64, total: u64, start: Instant, phase: &str) {
     let secs = start.elapsed().as_secs_f64().max(0.001);
     let speed = done_bytes as f64 / secs;
     let eta = (total.saturating_sub(done_bytes)) as f64 / speed.max(1.0);
+    let prefix = if phase.is_empty() { String::new() } else { format!("{phase}: ") };
     let detail = format!(
-        "{} / {}  ·  {}/s  ·  eta {}",
+        "{prefix}{} / {}  ·  {}/s  ·  eta {}",
         human(done_bytes),
         human(total),
         human(speed as u64),
         fmt_secs(eta)
     );
     let frac = if total == 0 { 1.0 } else { done_bytes as f64 / total as f64 };
+    let _ = tx.send(AppEvent::Op(OpEvent::Sample(speed as u64)));
     let _ = tx.send(AppEvent::Op(OpEvent::Progress(frac, detail)));
 }
 

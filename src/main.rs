@@ -2,6 +2,7 @@
 compile_error!("diskutility targets Windows (uses PowerShell storage cmdlets and \\\\.\\PhysicalDrive access)");
 
 mod app;
+mod bench;
 mod disks;
 mod logger;
 mod ops;

@@ -59,7 +59,15 @@ diskutility --update
 - **Format** — clean, partition (GPT/MBR), format, assign a drive letter.
 - **Quick erase** — destroy the partition table (fast).
 - **Secure erase** — zero-fill every sector with live speed/ETA (raw `\\.\PhysicalDriveN` writes).
-- **Write image** — dd-style sector writer for `.iso` / `.img` / `.raw` / `.bin` / `.wic` (bootable USB creation).
+- **Write image** — dd-style sector writer for `.iso` / `.img` / `.raw` / `.bin` / `.wic`,
+  followed by an automatic **bit-for-bit read-back verification**.
+- **Benchmark** (`b`) — sequential + random 4K speeds with a live graph.
+  The read benchmark is non-destructive and safe on any disk; the full
+  read/write benchmark wipes the target first. All I/O is unbuffered
+  (`FILE_FLAG_NO_BUFFERING`), so numbers measure the disk, not the cache.
+- **Capacity test** (`b`) — h2testw-style pattern write + verify that exposes
+  counterfeit "fake capacity" flash drives. Quick mode samples the whole
+  address space in minutes; full mode proves every byte.
 
 ## Safety
 
