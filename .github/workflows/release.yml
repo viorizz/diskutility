@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Prepare assets
+        shell: pwsh
+        run: |
+          Copy-Item target/release/diskutility.exe diskutility.exe
+          $hash = (Get-FileHash diskutility.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  diskutility.exe" | Out-File -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            diskutility.exe
+            checksums.txt
+          generate_release_notes: true

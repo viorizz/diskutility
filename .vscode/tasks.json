@@ -1,0 +1,25 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build (release)",
+            "type": "shell",
+            "command": "cargo build --release",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "cargo build (debug)",
+            "type": "shell",
+            "command": "cargo build",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "list disks (read-only check)",
+            "type": "shell",
+            "command": "cargo run --release -- --list",
+            "problemMatcher": ["$rustc"]
+        }
+    ]
+}

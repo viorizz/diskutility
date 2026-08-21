@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: viorizz.diskutility
+PackageVersion: 0.3.0
+InstallerType: portable
+Commands:
+  - diskutility
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/viorizz/diskutility/releases/download/v0.3.0/diskutility.exe
+    InstallerSha256: <FILL_FROM_RELEASE_CHECKSUMS_TXT>
+ManifestType: installer
+ManifestVersion: 1.6.0

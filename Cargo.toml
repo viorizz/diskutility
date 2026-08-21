@@ -1,0 +1,26 @@
+[package]
+name = "diskutility"
+version = "0.3.0"
+edition = "2021"
+description = "A terminal disk utility for Windows: format, erase, and write images to disks"
+
+[dependencies]
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
