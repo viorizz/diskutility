@@ -44,7 +44,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::EraseMenu { idx } => draw_erase_menu(f, area, *idx),
         Modal::TestMenu { idx } => draw_test_menu(f, area, *idx),
         Modal::Health { title, report } => draw_health(f, area, app, title, report.as_ref()),
-        Modal::Input { purpose, buf } => draw_input(f, area, purpose, buf),
+        Modal::BackupMenu { idx } => draw_backup_menu(f, area, app, *idx),
+        Modal::Input { purpose, buf } => draw_input(f, area, app, purpose, buf),
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
         Modal::Progress(p) => draw_progress(f, area, app, p),
     }
@@ -298,6 +299,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         txt(" write · "),
         key("s"),
         txt(" backup · "),
+        key("n"),
+        txt(" backup dir · "),
         key("d"),
         txt(" clone · "),
         key("b"),
@@ -440,7 +443,74 @@ fn draw_erase_menu(f: &mut Frame, area: Rect, idx: usize) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn draw_input(f: &mut Frame, area: Rect, purpose: &InputPurpose, buf: &str) {
+fn draw_backup_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
+    let choices = app.backup_choices();
+    let disk = app.selected_disk();
+    let h = 9 + choices.len() as u16;
+    let inner = modal_block(f, area, 78, h, "Backup — where should the image go?", ACCENT);
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(d) = disk {
+        lines.push(Line::from(vec![
+            Span::styled("Image size  ", Style::new().fg(DIM)),
+            Span::styled(human(d.size), Style::new().fg(TEXT).bold()),
+            Span::styled(
+                format!("   (raw sector image of disk {} · {})", d.number, d.name),
+                Style::new().fg(DIM),
+            ),
+        ]));
+        lines.push(Line::default());
+    }
+    for (i, (label, dir)) in choices.iter().enumerate() {
+        let selected = i == idx;
+        let marker = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::new().fg(ACCENT_SOFT).bg(SEL_BG).bold()
+        } else {
+            Style::new().fg(TEXT)
+        };
+        let free = dir
+            .as_deref()
+            .and_then(|d| crate::ops::free_space(&std::path::Path::new(d).join("x")))
+            .map(|b| format!("  {} free", human(b)))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{label}"), style),
+            Span::styled(free, Style::new().fg(DIM)),
+        ]));
+    }
+    lines.push(Line::default());
+    let hint = if app.config.backup_dir.is_some() {
+        "Enter choose · n change the saved destination · Esc cancel"
+    } else {
+        "Enter choose · n save a network drive / folder as your go-to destination · Esc cancel"
+    };
+    lines.push(Line::from(Span::styled(hint, Style::new().fg(DIM))));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+/// "Image 1.86 TB · 3.2 TB free on \\nas\backups" for the backup path prompt.
+fn backup_size_line(app: &App, buf: &str) -> Option<Line<'static>> {
+    let disk = app.selected_disk()?;
+    let mut spans = vec![
+        Span::styled("Image size ", Style::new().fg(DIM)),
+        Span::styled(human(disk.size), Style::new().fg(TEXT).bold()),
+    ];
+    let path = std::path::Path::new(buf.trim().trim_matches('"'));
+    if let Some(free) = crate::ops::free_space(path) {
+        let fits = free >= disk.size;
+        spans.push(Span::styled("   ·   ", Style::new().fg(DIM)));
+        spans.push(Span::styled(
+            format!("{} free at destination", human(free)),
+            Style::new().fg(if fits { OK_C } else { ERR_C }),
+        ));
+        if !fits {
+            spans.push(Span::styled("  — will not fit", Style::new().fg(ERR_C).bold()));
+        }
+    }
+    Some(Line::from(spans))
+}
+
+fn draw_input(f: &mut Frame, area: Rect, app: &App, purpose: &InputPurpose, buf: &str) {
     let (title, hint) = match purpose {
         InputPurpose::Label(p) => (
             format!("Volume label — {} ({})", p.name(), p.fs_display()),
@@ -454,22 +524,35 @@ fn draw_input(f: &mut Frame, area: Rect, purpose: &InputPurpose, buf: &str) {
             "Backup — save a full image of the selected disk to".to_string(),
             "full path for the .img file (must not be on the disk itself)   ·   Enter start · Esc cancel",
         ),
+        InputPurpose::BackupDir => (
+            "Default backup destination (network drive or folder)".to_string(),
+            r"Z:\backups or \\server\share\backups · mapped drives are stored as UNC · empty clears   ·   Enter save · Esc cancel",
+        ),
         InputPurpose::CloneTarget => (
             "Clone — which disk should be OVERWRITTEN with a copy of the selected disk?".to_string(),
             "type the TARGET disk number from the list   ·   Enter continue · Esc cancel",
         ),
     };
-    let inner = modal_block(f, area, 78, 7, &title, ACCENT);
-    let lines = vec![
+    let extra = match purpose {
+        InputPurpose::BackupPath => backup_size_line(app, buf),
+        _ => None,
+    };
+    let h = if extra.is_some() { 9 } else { 7 };
+    let inner = modal_block(f, area, 78, h, &title, ACCENT);
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
             Span::styled(buf.to_string(), Style::new().fg(TEXT)),
             Span::styled("▌", Style::new().fg(ACCENT_SOFT)),
         ]),
         Line::default(),
-        Line::from(Span::styled(hint, Style::new().fg(DIM))),
     ];
-    f.render_widget(Paragraph::new(lines), inner);
+    if let Some(l) = extra {
+        lines.push(l);
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(hint, Style::new().fg(DIM))));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_confirm(f: &mut Frame, area: Rect, app: &App, action: &PendingAction, buf: &str) {
@@ -799,7 +882,7 @@ fn draw_health(
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 24, "Help", ACCENT);
+    let inner = modal_block(f, area, 74, 25, "Help", ACCENT);
     let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
@@ -815,6 +898,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("b", "benchmark, surface scan & capacity tests"),
         key("h", "drive health: SMART wear, temperature, hours, error counts"),
         key("s", "backup the whole disk to an .img file (restore with i)"),
+        key("n", "set a network drive / folder as the default backup destination"),
         key("d", "clone the disk sector-for-sector onto another disk (verified)"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),

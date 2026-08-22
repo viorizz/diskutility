@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
+use crate::config::{self, Config};
 use crate::disks::{self, Disk};
 use crate::logger;
 use crate::ops::{self, OpEvent, Preset, PRESETS};
@@ -21,6 +22,8 @@ pub enum InputPurpose {
     Label(Preset),
     IsoPath,
     BackupPath,
+    /// Folder to remember as the default backup destination (`n` key).
+    BackupDir,
     CloneTarget,
 }
 
@@ -111,6 +114,8 @@ pub enum Modal {
     Presets { idx: usize },
     EraseMenu { idx: usize },
     TestMenu { idx: usize },
+    /// Where should the backup image go? Entries come from `App::backup_choices`.
+    BackupMenu { idx: usize },
     Health { title: String, report: Option<Result<ops::HealthReport, String>> },
     Input { purpose: InputPurpose, buf: String },
     Confirm { action: PendingAction, buf: String },
@@ -127,6 +132,7 @@ pub struct App {
     pub modal: Modal,
     pub status: Option<(String, bool, Instant)>,
     pub tick: usize,
+    pub config: Config,
     app_drive: Option<char>,
     /// Disk snapshotted by `guard()` for the action being configured/confirmed.
     pending_target: Option<Disk>,
@@ -139,6 +145,7 @@ impl App {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
+            config: config::load(),
             disks: Vec::new(),
             selected: 0,
             scanning: false,
@@ -287,7 +294,7 @@ impl App {
         }
     }
 
-    fn selected_disk(&self) -> Option<&Disk> {
+    pub fn selected_disk(&self) -> Option<&Disk> {
         self.disks.get(self.selected)
     }
 
@@ -415,6 +422,97 @@ impl App {
             (Some(c), Some(':')) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
             _ => None,
         }
+    }
+
+    /// Destination choices for the backup menu: (label, folder) — `None`
+    /// means "type a custom path".
+    pub fn backup_choices(&self) -> Vec<(String, Option<String>)> {
+        let mut v = Vec::new();
+        if let Some(dir) = &self.config.backup_dir {
+            v.push((format!("Saved destination   {dir}"), Some(dir.clone())));
+        }
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
+        v.push((format!("Home folder         {home}"), Some(home)));
+        v.push(("Custom path…".to_string(), None));
+        v
+    }
+
+    /// Suggested image filename for the selected disk: `disk2-WD_BLACK-20260822.img`.
+    fn backup_filename(disk: &Disk) -> String {
+        let safe_name: String = disk
+            .name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(24)
+            .collect();
+        let date = chrono::Local::now().format("%Y%m%d");
+        format!("disk{}-{safe_name}-{date}.img", disk.number)
+    }
+
+    fn open_backup_input(&mut self, dir: Option<String>) {
+        let Some(disk) = self.selected_disk() else {
+            self.error("no disk selected");
+            return;
+        };
+        let name = Self::backup_filename(disk);
+        let buf = match dir {
+            Some(d) => format!("{}\\{name}", d.trim_end_matches(['\\', '/'])),
+            None => String::new(),
+        };
+        self.modal = Modal::Input { purpose: InputPurpose::BackupPath, buf };
+    }
+
+    /// UNC target of a mapped network drive letter (`Z:` → `\\nas\backups`),
+    /// read from HKCU\Network where persistent mappings are recorded. Mapped
+    /// drives are usually invisible to an elevated process (UAC gives it a
+    /// separate token), so the UNC form is what we store and open.
+    fn mapped_drive_target(letter: char) -> Option<String> {
+        let script = format!(
+            "(Get-ItemProperty -LiteralPath 'HKCU:\\Network\\{}' -ErrorAction SilentlyContinue).RemotePath",
+            letter.to_ascii_uppercase()
+        );
+        let out = ops::run_ps_quiet(&script).ok()?;
+        let t = out.trim();
+        (t.starts_with("\\\\") && t.len() > 2).then(|| t.to_string())
+    }
+
+    /// Validate a folder for the saved backup destination. Returns the path
+    /// to store (UNC-resolved for mapped drives) or `None` to clear it.
+    fn validate_backup_dir(&self, raw: &str) -> Result<Option<String>, String> {
+        let trimmed = raw.trim().trim_matches('"').trim().trim_end_matches(['\\', '/']).to_string();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let mut dir = if trimmed.len() == 2 && trimmed.ends_with(':') { format!("{trimmed}\\") } else { trimmed };
+        let is_unc = dir.starts_with("\\\\");
+        let letter = dir
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_alphabetic() && dir.get(1..2) == Some(":"));
+        if !is_unc && letter.is_none() {
+            return Err(r"give an absolute folder: Z:\backups or \\server\share\backups".into());
+        }
+        if let Some(l) = letter {
+            if let Some(unc) = Self::mapped_drive_target(l) {
+                let rest = dir[2..].trim_start_matches('\\').to_string();
+                dir = if rest.is_empty() { unc } else { format!("{unc}\\{rest}") };
+                logger::log(format!("backup dir: {l}: is a mapped drive → using {dir}"));
+            }
+        }
+        let p = std::path::Path::new(&dir);
+        if !p.is_dir() {
+            let hint = if letter.is_some() && self.elevated {
+                r" (mapped network drives are often invisible to an elevated process — use the \\server\share form)"
+            } else {
+                ""
+            };
+            return Err(format!("folder not reachable: {dir}{hint}"));
+        }
+        // prove it is writable before trusting it with a multi-hour backup
+        let probe = p.join(format!(".diskutility-probe-{}", std::process::id()));
+        std::fs::write(&probe, b"").map_err(|e| format!("cannot write to {dir}: {e}"))?;
+        let _ = std::fs::remove_file(&probe);
+        Ok(Some(dir))
     }
 
     fn validate_backup(&self, raw: &str) -> Result<PathBuf, String> {
@@ -631,6 +729,30 @@ impl App {
                 },
                 _ => self.modal = Modal::TestMenu { idx },
             },
+            Modal::BackupMenu { mut idx } => {
+                let choices = self.backup_choices();
+                let n = choices.len().max(1);
+                match k.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        idx = (idx + n - 1) % n;
+                        self.modal = Modal::BackupMenu { idx };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        idx = (idx + 1) % n;
+                        self.modal = Modal::BackupMenu { idx };
+                    }
+                    KeyCode::Enter => {
+                        let dir = choices.get(idx).and_then(|(_, d)| d.clone());
+                        self.open_backup_input(dir);
+                    }
+                    KeyCode::Char('n') => {
+                        let buf = self.config.backup_dir.clone().unwrap_or_default();
+                        self.modal = Modal::Input { purpose: InputPurpose::BackupDir, buf };
+                    }
+                    _ => self.modal = Modal::BackupMenu { idx },
+                }
+            }
             Modal::Health { title, report } => match k.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('h') => {}
                 KeyCode::Char('c') => {
@@ -667,6 +789,23 @@ impl App {
                     },
                     InputPurpose::BackupPath => match self.validate_backup(&buf) {
                         Ok(path) => self.start_backup(path),
+                        Err(e) => {
+                            self.error(e);
+                            self.modal = Modal::Input { purpose, buf };
+                        }
+                    },
+                    InputPurpose::BackupDir => match self.validate_backup_dir(&buf) {
+                        Ok(dir) => {
+                            let msg = match &dir {
+                                Some(d) => format!("backup destination saved: {d}"),
+                                None => "backup destination cleared".to_string(),
+                            };
+                            self.config.backup_dir = dir;
+                            match config::save(&self.config) {
+                                Ok(()) => self.info(msg),
+                                Err(e) => self.error(format!("settings not saved: {e}")),
+                            }
+                        }
                         Err(e) => {
                             self.error(e);
                             self.modal = Modal::Input { purpose, buf };
@@ -802,19 +941,15 @@ impl App {
             KeyCode::Char('s') => {
                 if !self.elevated {
                     self.error("administrator rights required — restart this app from an elevated terminal");
-                } else if let Some(disk) = self.selected_disk() {
-                    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
-                    let safe_name: String = disk
-                        .name
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                        .take(24)
-                        .collect();
-                    let suggestion = format!("{home}\\disk{}-{safe_name}.img", disk.number);
-                    self.modal = Modal::Input { purpose: InputPurpose::BackupPath, buf: suggestion };
+                } else if self.selected_disk().is_some() {
+                    self.modal = Modal::BackupMenu { idx: 0 };
                 } else {
                     self.error("no disk selected");
                 }
+            }
+            KeyCode::Char('n') => {
+                let buf = self.config.backup_dir.clone().unwrap_or_default();
+                self.modal = Modal::Input { purpose: InputPurpose::BackupDir, buf };
             }
             KeyCode::Char('d') => {
                 if !self.elevated {

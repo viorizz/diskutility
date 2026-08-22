@@ -3,6 +3,7 @@ compile_error!("diskutility targets Windows (uses PowerShell storage cmdlets and
 
 mod app;
 mod bench;
+mod config;
 mod disks;
 mod logger;
 mod ops;
