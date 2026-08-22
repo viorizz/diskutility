@@ -68,6 +68,14 @@ diskutility --update
 - **Capacity test** (`b`) — h2testw-style pattern write + verify that exposes
   counterfeit "fake capacity" flash drives. Quick mode samples the whole
   address space in minutes; full mode proves every byte.
+- **Surface scan** (`b`) — non-destructive read of every sector that pinpoints
+  unreadable 4 KiB blocks.
+- **Health** (`h`) — SMART wear, temperature, power-on hours and error counts
+  (needs an elevated terminal; USB bridges usually block passthrough).
+- **Backup** (`s`) — full sector image of a disk to an `.img` file, with free
+  space and same-disk checks. Restore it onto any disk with `i`.
+- **Clone** (`d`) — sector-for-sector disk-to-disk copy with the partition
+  table written last (no mid-copy automount), followed by verification.
 
 ## Safety
 

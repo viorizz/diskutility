@@ -20,6 +20,8 @@ pub enum AppEvent {
 pub enum InputPurpose {
     Label(Preset),
     IsoPath,
+    BackupPath,
+    CloneTarget,
 }
 
 pub enum PendingAction {
@@ -29,6 +31,7 @@ pub enum PendingAction {
     WriteIso { path: PathBuf, size: u64 },
     BenchFull,
     Capacity { full: bool },
+    CloneFrom { source: Disk },
 }
 
 impl PendingAction {
@@ -43,6 +46,9 @@ impl PendingAction {
             PendingAction::BenchFull => format!("Benchmarking disk {disk} (read + write)"),
             PendingAction::Capacity { full: false } => format!("Capacity test on disk {disk} (quick)"),
             PendingAction::Capacity { full: true } => format!("Capacity test on disk {disk} (full)"),
+            PendingAction::CloneFrom { source } => {
+                format!("Cloning disk {} → disk {disk}", source.number)
+            }
         }
     }
 
@@ -72,6 +78,12 @@ impl PendingAction {
             PendingAction::Capacity { full: true } => {
                 "FULL capacity test — wipes the disk, writes & verifies EVERY byte (hours)".into()
             }
+            PendingAction::CloneFrom { source } => format!(
+                "Overwrite THIS disk with a sector-for-sector clone of disk {} ({} · {}), then verify",
+                source.number,
+                source.name,
+                disks::human(source.size)
+            ),
         }
     }
 
@@ -361,9 +373,152 @@ impl App {
         true
     }
 
+    /// Like `guard()` but for an explicitly chosen disk (the clone target).
+    fn guard_target(&mut self, target: &Disk) -> bool {
+        let reasons = self.protection_reasons(target);
+        if !reasons.is_empty() && !self.unlocked {
+            self.error(format!(
+                "disk {} is protected ({}) — press u to enable the safety override",
+                target.number,
+                reasons.join(", ")
+            ));
+            return false;
+        }
+        if !self.elevated {
+            self.error("administrator rights required — restart this app from an elevated terminal");
+            return false;
+        }
+        self.pending_target = Some(target.clone());
+        true
+    }
+
     /// True when two scan results describe the same physical device.
     fn same_device(a: &Disk, b: &Disk) -> bool {
         a.number == b.number && a.serial == b.serial && a.size == b.size && a.name == b.name
+    }
+
+    /// The live entry for a previously snapshotted disk, if it is still the
+    /// same device at the same number.
+    fn live_match(&self, snapshot: &Disk) -> Option<&Disk> {
+        self.disks
+            .iter()
+            .find(|d| d.number == snapshot.number)
+            .filter(|d| Self::same_device(d, snapshot))
+    }
+
+    /// Drive letter (uppercase) of a drive-letter path, after canonicalizing.
+    fn drive_of(path: &std::path::Path) -> Option<char> {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let s = resolved.to_str()?.trim_start_matches(r"\\?\").to_string();
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (Some(c), Some(':')) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
+            _ => None,
+        }
+    }
+
+    fn validate_backup(&self, raw: &str) -> Result<PathBuf, String> {
+        let trimmed = raw.trim().trim_matches('"').trim();
+        if trimmed.is_empty() {
+            return Err("enter a destination path for the image file".into());
+        }
+        let mut path = PathBuf::from(trimmed);
+        if path.extension().is_none() {
+            path.set_extension("img");
+        }
+        if path.exists() {
+            return Err("that file already exists — choose a new name (nothing is overwritten)".into());
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or("give a full path, e.g. D:\\backups\\disk2.img")?;
+        if !parent.is_dir() {
+            return Err(format!("folder does not exist: {}", parent.display()));
+        }
+        let disk = self.selected_disk().ok_or("no disk selected")?;
+        // the image must not land on the disk being imaged: the copy would
+        // chase its own tail and never be consistent
+        if let Some(drive) = Self::drive_of(parent) {
+            if disk.partitions.iter().any(|p| p.letter.chars().next().map(|c| c.to_ascii_uppercase()) == Some(drive)) {
+                return Err(format!(
+                    "destination is on disk {} ({drive}:) — the disk being backed up. Save the image somewhere else.",
+                    disk.number
+                ));
+            }
+        }
+        if let Some(free) = ops::free_space(&path) {
+            if free < disk.size {
+                return Err(format!(
+                    "not enough free space: {} available, {} needed for a full image of disk {}",
+                    disks::human(free),
+                    disks::human(disk.size),
+                    disk.number
+                ));
+            }
+        }
+        Ok(path)
+    }
+
+    fn validate_clone_target(&self, raw: &str) -> Result<(Disk, Disk), String> {
+        let source = self.selected_disk().cloned().ok_or("no disk selected")?;
+        let n: u32 = raw
+            .trim()
+            .parse()
+            .map_err(|_| "type the number of the TARGET disk (the one that will be overwritten)")?;
+        let target = self
+            .disks
+            .iter()
+            .find(|d| d.number == n)
+            .cloned()
+            .ok_or(format!("there is no disk {n} — check the list"))?;
+        if Self::same_device(&target, &source)
+            || (target.size == source.size && target.serial == source.serial && !source.serial.is_empty())
+        {
+            return Err("source and target are the same device — pick a different target".into());
+        }
+        if target.size < source.size {
+            return Err(format!(
+                "target disk {n} ({}) is smaller than the source ({}) — shrinking clones are not supported",
+                disks::human(target.size),
+                disks::human(source.size)
+            ));
+        }
+        Ok((source, target))
+    }
+
+    fn start_backup(&mut self, path: PathBuf) {
+        let Some(disk) = self.selected_disk().cloned() else {
+            self.error("no disk selected");
+            return;
+        };
+        logger::log(format!(
+            "action start: backup — source disk {} · {} · serial {} · {} → {}",
+            disk.number,
+            disk.name,
+            disk.serial,
+            disks::human(disk.size),
+            path.display()
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = ProgressState {
+            title: format!("Backing up disk {} to image", disk.number),
+            pct: None,
+            detail: String::new(),
+            samples: Vec::new(),
+            logs: vec![format!(
+                "Source: disk {} · {} · {}",
+                disk.number,
+                disk.name,
+                disks::human(disk.size)
+            )],
+            started: Instant::now(),
+            done: None,
+            cancel: cancel.clone(),
+            cancellable: true,
+        };
+        ops::spawn_backup(self.tx.clone(), disk, path, cancel);
+        self.modal = Modal::Progress(progress);
     }
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -501,6 +656,27 @@ impl App {
                             self.modal = Modal::Input { purpose, buf };
                         }
                     },
+                    InputPurpose::BackupPath => match self.validate_backup(&buf) {
+                        Ok(path) => self.start_backup(path),
+                        Err(e) => {
+                            self.error(e);
+                            self.modal = Modal::Input { purpose, buf };
+                        }
+                    },
+                    InputPurpose::CloneTarget => match self.validate_clone_target(&buf) {
+                        Ok((source, target)) => {
+                            if self.guard_target(&target) {
+                                self.modal = Modal::Confirm {
+                                    action: PendingAction::CloneFrom { source },
+                                    buf: String::new(),
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            self.error(e);
+                            self.modal = Modal::Input { purpose, buf };
+                        }
+                    },
                 },
                 KeyCode::Char(c) if !c.is_control() => {
                     buf.push(c);
@@ -614,6 +790,32 @@ impl App {
                     self.error("no disk selected");
                 }
             }
+            KeyCode::Char('s') => {
+                if !self.elevated {
+                    self.error("administrator rights required — restart this app from an elevated terminal");
+                } else if let Some(disk) = self.selected_disk() {
+                    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
+                    let safe_name: String = disk
+                        .name
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                        .take(24)
+                        .collect();
+                    let suggestion = format!("{home}\\disk{}-{safe_name}.img", disk.number);
+                    self.modal = Modal::Input { purpose: InputPurpose::BackupPath, buf: suggestion };
+                } else {
+                    self.error("no disk selected");
+                }
+            }
+            KeyCode::Char('d') => {
+                if !self.elevated {
+                    self.error("administrator rights required — restart this app from an elevated terminal");
+                } else if self.selected_disk().is_some() {
+                    self.modal = Modal::Input { purpose: InputPurpose::CloneTarget, buf: String::new() };
+                } else {
+                    self.error("no disk selected");
+                }
+            }
             _ => {}
         }
     }
@@ -689,18 +891,15 @@ impl App {
             return;
         };
         // The disk list may have been refreshed while the dialog was open (a
-        // scan finishing, a drive unplugged): make sure the highlighted row is
-        // still the device the user confirmed before running anything.
-        match self.selected_disk() {
-            Some(current) if Self::same_device(current, &disk) => {}
-            _ => {
-                self.pending_target = None;
-                self.error(format!(
-                    "the disk list changed since you selected disk {} — nothing was touched. Re-select the disk and retry.",
-                    disk.number
-                ));
-                return;
-            }
+        // scan finishing, a drive unplugged): make sure the confirmed target is
+        // still the same device at the same number before running anything.
+        if self.live_match(&disk).is_none() {
+            self.pending_target = None;
+            self.error(format!(
+                "the disk list changed since you selected disk {} — nothing was touched. Re-select the disk and retry.",
+                disk.number
+            ));
+            return;
         }
         // belt-and-braces: protected disks always require the explicit override
         if !self.protection_reasons(&disk).is_empty() && !self.unlocked {
@@ -758,6 +957,24 @@ impl App {
             }
             PendingAction::Capacity { full } => {
                 crate::bench::spawn_capacity_test(tx, disk, full, cancel, allow_protected)
+            }
+            PendingAction::CloneFrom { source } => {
+                if self.live_match(&source).is_none() {
+                    self.pending_target = None;
+                    self.error(format!(
+                        "the source disk {} changed since you selected it — nothing was touched. Re-select and retry.",
+                        source.number
+                    ));
+                    return;
+                }
+                logger::log(format!(
+                    "clone source: disk {} · {} · serial {} · {}",
+                    source.number,
+                    source.name,
+                    source.serial,
+                    disks::human(source.size)
+                ));
+                ops::spawn_clone(tx, source, disk, cancel, allow_protected)
             }
         }
         self.modal = Modal::Progress(progress);

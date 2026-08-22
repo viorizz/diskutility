@@ -295,7 +295,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         key("e"),
         txt(" erase · "),
         key("i"),
-        txt(" write image · "),
+        txt(" write · "),
+        key("s"),
+        txt(" backup · "),
+        key("d"),
+        txt(" clone · "),
         key("b"),
         txt(" test · "),
         key("h"),
@@ -303,7 +307,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         key("r"),
         txt(" rescan · "),
         key("c"),
-        txt(" copy log · "),
+        txt(" log · "),
         key("u"),
         txt(if app.unlocked { " re-lock · " } else { " override · " }),
         key("?"),
@@ -446,8 +450,16 @@ fn draw_input(f: &mut Frame, area: Rect, purpose: &InputPurpose, buf: &str) {
             "Path to disk image (.iso / .img)".to_string(),
             "paste or type the full path   ·   Enter continue · Esc cancel",
         ),
+        InputPurpose::BackupPath => (
+            "Backup — save a full image of the selected disk to".to_string(),
+            "full path for the .img file (must not be on the disk itself)   ·   Enter start · Esc cancel",
+        ),
+        InputPurpose::CloneTarget => (
+            "Clone — which disk should be OVERWRITTEN with a copy of the selected disk?".to_string(),
+            "type the TARGET disk number from the list   ·   Enter continue · Esc cancel",
+        ),
     };
-    let inner = modal_block(f, area, 68, 7, &title, ACCENT);
+    let inner = modal_block(f, area, 78, 7, &title, ACCENT);
     let lines = vec![
         Line::from(vec![
             Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
@@ -787,7 +799,7 @@ fn draw_health(
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 22, "Help", ACCENT);
+    let inner = modal_block(f, area, 74, 24, "Help", ACCENT);
     let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
@@ -802,6 +814,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("i", "write a bootable .iso/.img image to the disk (verified)"),
         key("b", "benchmark, surface scan & capacity tests"),
         key("h", "drive health: SMART wear, temperature, hours, error counts"),
+        key("s", "backup the whole disk to an .img file (restore with i)"),
+        key("d", "clone the disk sector-for-sector onto another disk (verified)"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),
         key("u", "toggle safety override — allow protected disks (DANGEROUS)"),

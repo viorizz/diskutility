@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -622,8 +622,17 @@ pub fn spawn_write_iso(
             let mut buf = vec![0u8; CHUNK];
             let start = Instant::now();
             let mut last = Instant::now();
-            let mut written: u64 = 0;
-            let mut remaining = image_size;
+            // The first chunk holds the partition table. It is written LAST:
+            // as soon as a valid table lands at sector 0 Windows may automount
+            // the new volumes and then refuse further raw writes to them.
+            let first_len = image_size.min(CHUNK as u64) as usize;
+            let mut first = vec![0u8; first_len.div_ceil(512) * 512];
+            src.read_exact(&mut first[..first_len])
+                .map_err(|e| format!("read failed at 0: {e}"))?;
+            dev.seek(SeekFrom::Start(first.len() as u64))
+                .map_err(|e| format!("seek failed: {e}"))?;
+            let mut written: u64 = first_len as u64;
+            let mut remaining = image_size - first_len as u64;
             while remaining > 0 {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("cancelled — the disk contains an incomplete image; erase it before use".into());
@@ -645,6 +654,9 @@ pub fn spawn_write_iso(
                     last = Instant::now();
                 }
             }
+            log(&tx, "Writing the partition table (first sectors)…");
+            dev.seek(SeekFrom::Start(0)).map_err(|e| format!("seek failed: {e}"))?;
+            dev.write_all(&first).map_err(|e| format!("write failed at 0: {e}"))?;
             dev.sync_all().map_err(|e| format!("flush failed: {e}"))?;
             progress(&tx, image_size, image_size, start);
             drop(dev);
@@ -692,6 +704,187 @@ pub fn spawn_write_iso(
             Ok(format!(
                 "Image written to disk {} and verified bit-for-bit in {}. If Windows prompts to format new partitions, cancel those prompts.",
                 disk.number,
+                fmt_secs(start.elapsed().as_secs_f64())
+            ))
+        })();
+        done(&tx, result);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Backup (disk → image file) and clone (disk → disk)
+// ---------------------------------------------------------------------------
+
+/// Free bytes on the volume that holds `path` (its parent directory).
+pub fn free_space(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free) };
+    (ok != 0).then_some(free)
+}
+
+/// Read the whole disk through an uncached handle into an image file.
+/// Non-destructive for the disk; a cancelled run deletes the partial file.
+pub fn spawn_backup(tx: Sender<AppEvent>, disk: Disk, path: PathBuf, cancel: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let result = (|| -> Result<String, String> {
+            log(&tx, format!("Backing up disk {} ({}) → {}", disk.number, human(disk.size), path.display()));
+            if !disk.partitions.is_empty() {
+                log(&tx, "Note: volumes are mounted — this is a live snapshot; close programs writing to the disk for a consistent image.");
+            }
+            let mut src = crate::bench::open_direct(disk.number, false)?;
+            let mut out = File::create(&path).map_err(|e| format!("cannot create image file: {e}"))?;
+            let mut buf = crate::bench::AlignedBuf::new(CHUNK);
+            let total = disk.size;
+            let start = Instant::now();
+            let mut last = Instant::now();
+            let mut done_b = 0u64;
+            while done_b < total {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(out);
+                    let _ = std::fs::remove_file(&path);
+                    return Err("cancelled — the partial image file was deleted".into());
+                }
+                let want = (total - done_b).min(CHUNK as u64) as usize;
+                src.read_exact(&mut buf.as_mut()[..want])
+                    .map_err(|e| format!("disk read failed at {}: {e}", human(done_b)))?;
+                out.write_all(&buf.as_ref()[..want])
+                    .map_err(|e| format!("image write failed at {}: {e} (destination full?)", human(done_b)))?;
+                done_b += want as u64;
+                if last.elapsed() >= Duration::from_millis(250) {
+                    progress_with(&tx, done_b, total, start, "backup");
+                    last = Instant::now();
+                }
+            }
+            out.sync_all().map_err(|e| format!("flush failed: {e}"))?;
+            progress_with(&tx, total, total, start, "backup");
+            Ok(format!(
+                "Backed up disk {} to {} ({}) in {}. Restore it onto any disk of at least that size with i (write image).",
+                disk.number,
+                path.display(),
+                human(total),
+                fmt_secs(start.elapsed().as_secs_f64())
+            ))
+        })();
+        done(&tx, result);
+    });
+}
+
+/// Sector-for-sector copy of `source` onto `target`. The target is wiped via
+/// the prep script (identity check included); the source is only read.
+pub fn spawn_clone(
+    tx: Sender<AppEvent>,
+    source: Disk,
+    target: Disk,
+    cancel: Arc<AtomicBool>,
+    allow_protected: bool,
+) {
+    thread::spawn(move || {
+        let result = (|| -> Result<String, String> {
+            log(&tx, format!(
+                "Clone: disk {} ({} · {}) → disk {} ({} · {})",
+                source.number, source.name, human(source.size),
+                target.number, target.name, human(target.size)
+            ));
+            if source.size > target.size {
+                return Err(format!(
+                    "source ({}) is larger than target ({}) — shrinking clones are not supported",
+                    human(source.size),
+                    human(target.size)
+                ));
+            }
+            if !source.partitions.is_empty() {
+                log(&tx, "Note: source volumes are mounted — this is a live snapshot; close programs writing to it for a consistent clone.");
+            }
+            log(&tx, "Preparing target (identity check, write-protection, wipe)…");
+            run_prep(&tx, &target, allow_protected)?;
+            let mut src = crate::bench::open_direct(source.number, false)?;
+            let mut dst = open_physical(target.number)?;
+            let mut buf = crate::bench::AlignedBuf::new(CHUNK);
+            let total = source.size;
+            let start = Instant::now();
+            let mut last = Instant::now();
+            // partition table (first chunk) is written last — see spawn_write_iso
+            let first_len = total.min(CHUNK as u64) as usize;
+            let mut first = crate::bench::AlignedBuf::new(CHUNK);
+            src.read_exact(&mut first.as_mut()[..first_len])
+                .map_err(|e| format!("source read failed at 0: {e}"))?;
+            dst.seek(SeekFrom::Start(first_len as u64)).map_err(|e| format!("seek failed: {e}"))?;
+            let mut done_b = first_len as u64;
+            while done_b < total {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled — the target holds an incomplete clone; erase it before use".into());
+                }
+                let want = (total - done_b).min(CHUNK as u64) as usize;
+                src.read_exact(&mut buf.as_mut()[..want])
+                    .map_err(|e| format!("source read failed at {}: {e}", human(done_b)))?;
+                dst.write_all(&buf.as_ref()[..want])
+                    .map_err(|e| format!("target write failed at {}: {e}", human(done_b)))?;
+                done_b += want as u64;
+                if last.elapsed() >= Duration::from_millis(250) {
+                    progress_with(&tx, done_b, total, start, "clone");
+                    last = Instant::now();
+                }
+            }
+            log(&tx, "Writing the partition table (first sectors)…");
+            dst.seek(SeekFrom::Start(0)).map_err(|e| format!("seek failed: {e}"))?;
+            dst.write_all(&first.as_ref()[..first_len])
+                .map_err(|e| format!("target write failed at 0: {e}"))?;
+            dst.sync_all().map_err(|e| format!("flush failed: {e}"))?;
+            drop(dst);
+            drop(src);
+            progress_with(&tx, total, total, start, "clone");
+
+            log(&tx, "Verifying — comparing target against source…");
+            let mut src = crate::bench::open_direct(source.number, false)?;
+            let mut dst = crate::bench::open_direct(target.number, false)?;
+            let mut sbuf = crate::bench::AlignedBuf::new(CHUNK);
+            let mut dbuf = crate::bench::AlignedBuf::new(CHUNK);
+            let vstart = Instant::now();
+            let mut last = Instant::now();
+            let mut checked = 0u64;
+            while checked < total {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled during verification — the clone itself was fully written".into());
+                }
+                let want = (total - checked).min(CHUNK as u64) as usize;
+                src.read_exact(&mut sbuf.as_mut()[..want])
+                    .map_err(|e| format!("source re-read failed at {}: {e}", human(checked)))?;
+                dst.read_exact(&mut dbuf.as_mut()[..want])
+                    .map_err(|e| format!("target read-back failed at {}: {e}", human(checked)))?;
+                if sbuf.as_ref()[..want] != dbuf.as_ref()[..want] {
+                    let pos = sbuf.as_ref()[..want]
+                        .iter()
+                        .zip(&dbuf.as_ref()[..want])
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0) as u64;
+                    return Err(format!(
+                        "VERIFICATION FAILED at offset {} — target does not match source (a live source that changed during the copy, or a faulty target). Retry with the source idle, or test the target (b).",
+                        human(checked + pos)
+                    ));
+                }
+                checked += want as u64;
+                if last.elapsed() >= Duration::from_millis(250) {
+                    progress_with(&tx, checked, total, vstart, "verify");
+                    last = Instant::now();
+                }
+            }
+            log(&tx, "Verification passed — target matches source sector-for-sector.");
+            log(&tx, "Bringing the clone online…");
+            let _ = run_ps(&format!(
+                "Set-Disk -Number {} -IsOffline $false -ErrorAction SilentlyContinue\nUpdate-HostStorageCache",
+                target.number
+            ));
+            Ok(format!(
+                "Cloned disk {} → disk {} ({}) in {}. If Windows keeps the clone offline because its signature collides with the source, unplug the source or online it in Disk Management.",
+                source.number,
+                target.number,
+                human(total),
                 fmt_secs(start.elapsed().as_secs_f64())
             ))
         })();

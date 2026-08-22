@@ -1,6 +1,6 @@
 [package]
 name = "diskutility"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "A terminal disk utility for Windows: format, erase, and write images to disks"
 
@@ -17,6 +17,7 @@ version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ]
 
