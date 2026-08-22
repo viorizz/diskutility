@@ -762,11 +762,12 @@ pub fn verify_identity(disk: &Disk) -> Result<(), String> {
          $d = Get-Disk -Number {n}\n\
          $liveSerial = ([string]$d.SerialNumber).Trim()\n\
          $liveName = ([string]$d.FriendlyName).Trim()\n\
-         if ([uint64]$d.Size -ne [uint64]{size} -or $liveName -ne '{name}' -or ('{serial}' -ne '' -and $liveSerial -ne '{serial}')) {{ throw \"disk {n} is no longer the device you selected (found '$liveName' serial '$liveSerial' $($d.Size) bytes) - disk numbers change when drives are plugged or unplugged; rescan (r) and retry\" }}\n\
+         if ([uint64]$d.Size -ne [uint64]{size} -or ('{name}' -ne '' -and $liveName -ne '{name}') -or ('{serial}' -ne '' -and $liveSerial -ne '{serial}')) {{ throw \"disk {n} is no longer the device you selected (found '$liveName' serial '$liveSerial' $($d.Size) bytes) - disk numbers change when drives are plugged or unplugged; rescan (r) and retry\" }}\n\
          Write-Output 'identity: verified'",
         n = disk.number,
         size = disk.size,
-        name = ps_quote(&disk.name),
+        // an empty FriendlyName is shown as UNKNOWN_NAME; don't compare it
+        name = if disk.name == crate::disks::UNKNOWN_NAME { String::new() } else { ps_quote(&disk.name) },
         serial = ps_quote(&disk.serial),
     );
     run_ps(&script).map(|_| ())
@@ -894,12 +895,21 @@ pub fn spawn_clone(
             // table at end-of-disk and offer to "restore" it — zero it.
             if target.size > source.size {
                 const TAIL: u64 = 1024 * 1024;
-                let tail_start = target.size.saturating_sub(TAIL) / 512 * 512;
-                let tail_len = (target.size - tail_start) as usize;
-                log(&tx, format!("Target is larger than source — clearing its old end-of-disk GPT area ({})", human(tail_len as u64)));
-                dst.seek(SeekFrom::Start(tail_start)).map_err(|e| format!("seek failed: {e}"))?;
-                dst.write_all(&vec![0u8; tail_len])
-                    .map_err(|e| format!("target tail clear failed: {e}"))?;
+                // never reach back into the cloned data: the clone's own backup
+                // GPT lives in the last sectors of source.size
+                let tail_start = target
+                    .size
+                    .saturating_sub(TAIL)
+                    .max(source.size)
+                    .div_ceil(512)
+                    * 512;
+                if tail_start < target.size {
+                    let tail_len = (target.size - tail_start) as usize;
+                    log(&tx, format!("Target is larger than source — clearing its old end-of-disk GPT area ({})", human(tail_len as u64)));
+                    dst.seek(SeekFrom::Start(tail_start)).map_err(|e| format!("seek failed: {e}"))?;
+                    dst.write_all(&vec![0u8; tail_len])
+                        .map_err(|e| format!("target tail clear failed: {e}"))?;
+                }
             }
             log(&tx, "Writing the partition table (first sectors)…");
             dst.seek(SeekFrom::Start(0)).map_err(|e| format!("seek failed: {e}"))?;
