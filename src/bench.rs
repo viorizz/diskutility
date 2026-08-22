@@ -245,6 +245,83 @@ pub fn spawn_read_bench(tx: Sender<AppEvent>, disk: Disk, cancel: Arc<AtomicBool
     });
 }
 
+/// Non-destructive surface scan: read every sector; on a failed chunk, probe
+/// it 4 KiB at a time to pinpoint the unreadable blocks.
+pub fn spawn_surface_scan(tx: Sender<AppEvent>, disk: Disk, cancel: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let result = (|| -> Result<String, String> {
+            const MAX_BAD: usize = 2000;
+            log(&tx, format!("Surface scan — reading all {} (non-destructive)…", human(disk.size)));
+            let mut f = open_direct(disk.number, false)?;
+            let total = disk.size / 4096 * 4096;
+            let mut buf = AlignedBuf::new(SEQ_CHUNK);
+            let mut bad: Vec<u64> = Vec::new();
+            let start = Instant::now();
+            let mut last = Instant::now();
+            let mut done = 0u64;
+            while done < total {
+                if cancelled(&cancel) {
+                    return Err(format!(
+                        "cancelled at {} — {} bad block(s) found so far",
+                        human(done),
+                        bad.len()
+                    ));
+                }
+                let want = (((total - done).min(SEQ_CHUNK as u64)) as usize) / 4096 * 4096;
+                f.seek(SeekFrom::Start(done)).map_err(|e| format!("seek: {e}"))?;
+                if f.read_exact(&mut buf.as_mut()[..want]).is_err() {
+                    // localize: probe each 4 KiB block of the failed chunk
+                    let mut off = done;
+                    while off < done + want as u64 {
+                        if cancelled(&cancel) {
+                            break;
+                        }
+                        let ok = f
+                            .seek(SeekFrom::Start(off))
+                            .and_then(|_| f.read_exact(&mut buf.as_mut()[..4096]))
+                            .is_ok();
+                        if !ok {
+                            if bad.len() < MAX_BAD {
+                                if bad.len() < 20 {
+                                    log(&tx, format!("unreadable block at {}", human(off)));
+                                }
+                                bad.push(off);
+                            } else {
+                                return Err(format!(
+                                    "aborted: more than {MAX_BAD} unreadable blocks (first at {}) — this drive is failing, stop using it and recover data now",
+                                    human(bad[0])
+                                ));
+                            }
+                        }
+                        off += 4096;
+                    }
+                }
+                done += want as u64;
+                if last.elapsed() >= Duration::from_millis(250) {
+                    ops::progress_with(&tx, done, total, start, "scan");
+                    last = Instant::now();
+                }
+            }
+            ops::progress_with(&tx, total, total, start, "scan");
+            if bad.is_empty() {
+                Ok(format!(
+                    "Surface scan PASSED — every sector of {} readable, 0 bad blocks ({}).",
+                    human(total),
+                    crate::ops::fmt_secs_pub(start.elapsed().as_secs_f64())
+                ))
+            } else {
+                Err(format!(
+                    "{} unreadable 4 KiB block(s): first at {}, last at {}. The drive is developing bad sectors — back up your data and plan a replacement.",
+                    bad.len(),
+                    human(bad[0]),
+                    human(*bad.last().unwrap())
+                ))
+            }
+        })();
+        send(&tx, OpEvent::Done(result));
+    });
+}
+
 pub fn spawn_full_bench(
     tx: Sender<AppEvent>,
     disk: Disk,
@@ -254,7 +331,7 @@ pub fn spawn_full_bench(
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
             log(&tx, "Full benchmark — wiping disk first (all data destroyed).");
-            ops::run_prep(&tx, disk.number, allow_protected)?;
+            ops::run_prep(&tx, &disk, allow_protected)?;
             let mut f = open_direct(disk.number, true)?;
             log(&tx, "Sequential write…");
             let sw = seq_pass(&tx, &mut f, disk.size, true, "seq write", &cancel)?;
@@ -288,7 +365,7 @@ pub fn spawn_capacity_test(
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
             log(&tx, "Capacity test — wiping disk first (all data destroyed).");
-            ops::run_prep(&tx, disk.number, allow_protected)?;
+            ops::run_prep(&tx, &disk, allow_protected)?;
             if full {
                 capacity_full(&tx, &disk, &cancel)
             } else {

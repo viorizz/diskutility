@@ -9,9 +9,26 @@ $release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest
 $asset = $release.assets | Where-Object name -eq 'diskutility.exe' | Select-Object -First 1
 if (-not $asset) { throw "no diskutility.exe asset found in the latest release" }
 
+$sums = $release.assets | Where-Object name -eq 'checksums.txt' | Select-Object -First 1
+if (-not $sums) { throw "no checksums.txt asset found in the latest release - refusing to install an unverified binary" }
+$expected = "https://github.com/$repo/releases/download/"
+foreach ($u in @($asset.browser_download_url, $sums.browser_download_url)) {
+    if (-not $u.StartsWith($expected)) { throw "unexpected download location: $u" }
+}
+
 New-Item -ItemType Directory -Force $dir | Out-Null
 $exe = Join-Path $dir 'diskutility.exe'
-Invoke-WebRequest $asset.browser_download_url -OutFile $exe -UseBasicParsing
+$staged = "$exe.new"
+Invoke-WebRequest $asset.browser_download_url -OutFile $staged -UseBasicParsing
+$sumText = (Invoke-WebRequest $sums.browser_download_url -UseBasicParsing).Content
+$want = ($sumText -split "`n" | Where-Object { $_ -match 'diskutility\.exe' } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
+$have = (Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash
+if (-not $want -or $want.ToLower() -ne $have.ToLower()) {
+    Remove-Item -Force $staged -ErrorAction SilentlyContinue
+    throw "SHA256 mismatch: expected '$want', got '$have' - download corrupted or tampered, aborting"
+}
+Write-Host "SHA256 verified: $have" -ForegroundColor DarkGray
+Move-Item -Force $staged $exe
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $dir) {

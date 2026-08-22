@@ -43,6 +43,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::Presets { idx } => draw_presets(f, area, *idx),
         Modal::EraseMenu { idx } => draw_erase_menu(f, area, *idx),
         Modal::TestMenu { idx } => draw_test_menu(f, area, *idx),
+        Modal::Health { title, report } => draw_health(f, area, app, title, report.as_ref()),
         Modal::Input { purpose, buf } => draw_input(f, area, purpose, buf),
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
         Modal::Progress(p) => draw_progress(f, area, app, p),
@@ -297,6 +298,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         txt(" write image · "),
         key("b"),
         txt(" test · "),
+        key("h"),
+        txt(" health · "),
         key("r"),
         txt(" rescan · "),
         key("c"),
@@ -372,11 +375,15 @@ fn draw_presets(f: &mut Frame, area: Rect, idx: usize) {
 }
 
 fn draw_test_menu(f: &mut Frame, area: Rect, idx: usize) {
-    let inner = modal_block(f, area, 72, 14, "Test disk", ACCENT);
-    let opts: [(&str, &str); 4] = [
+    let inner = modal_block(f, area, 72, 15, "Test disk", ACCENT);
+    let opts: [(&str, &str); 5] = [
         (
             "Read benchmark  (safe)",
             "Sequential + random 4K read speed with a live graph. Non-destructive — safe on any disk, even the system disk. Starts immediately.",
+        ),
+        (
+            "Surface scan  (safe)",
+            "Reads every sector and pinpoints unreadable 4 KiB blocks. Non-destructive; takes as long as one full read of the disk. Starts immediately.",
         ),
         (
             "Full benchmark  (DESTROYS DATA)",
@@ -454,10 +461,30 @@ fn draw_input(f: &mut Frame, area: Rect, purpose: &InputPurpose, buf: &str) {
 }
 
 fn draw_confirm(f: &mut Frame, area: Rect, app: &App, action: &PendingAction, buf: &str) {
-    let disk: Option<&Disk> = app.disks.get(app.selected);
+    let disk: Option<&Disk> = app.target_disk();
     let reasons: Vec<&str> = disk.map(|d| app.protection_reasons(d)).unwrap_or_default();
     let protected = !reasons.is_empty();
-    let height = if protected { 16 } else { 13 };
+    let internal = disk.and_then(App::internal_bus_warning);
+    let volumes: Vec<String> = disk
+        .map(|d| {
+            d.partitions
+                .iter()
+                .filter(|p| !p.letter.is_empty() || !p.fs.is_empty())
+                .map(|p| {
+                    let letter = if p.letter.is_empty() { String::new() } else { format!("{}: ", p.letter) };
+                    let used = p.size.saturating_sub(p.free);
+                    format!("{letter}{} {} used", if p.fs.is_empty() { "?" } else { &p.fs }, human(used))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut height = 14;
+    if protected {
+        height += 3;
+    }
+    if internal.is_some() {
+        height += 2;
+    }
     let inner = modal_block(f, area, 70, height, "⚠ DESTRUCTIVE OPERATION", ERR_C);
     let (num, dname, dsize) = disk
         .map(|d| (d.number.to_string(), d.name.clone(), human(d.size)))
@@ -476,8 +503,22 @@ fn draw_confirm(f: &mut Frame, area: Rect, app: &App, action: &PendingAction, bu
             Span::styled("Action   ", Style::new().fg(DIM)),
             Span::styled(action.summary(), Style::new().fg(TEXT)),
         ]),
+        Line::from(vec![
+            Span::styled("Contains ", Style::new().fg(DIM)),
+            Span::styled(
+                if volumes.is_empty() { "no recognised volumes".to_string() } else { volumes.join(" · ") },
+                Style::new().fg(WARN_C),
+            ),
+        ]),
         Line::default(),
     ];
+    if let Some(w) = &internal {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ INTERNAL DISK: {w}. Is this really the drive you meant?"),
+            Style::new().fg(WARN_C).bold(),
+        )));
+        lines.push(Line::default());
+    }
     if protected {
         lines.push(Line::from(Span::styled(
             format!("⛨ PROTECTED DISK: {}", reasons.join(" · ")),
@@ -642,8 +683,111 @@ fn draw_progress(f: &mut Frame, area: Rect, app: &App, p: &ProgressState) {
     );
 }
 
+fn draw_health(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    title: &str,
+    report: Option<&Result<crate::ops::HealthReport, String>>,
+) {
+    let inner = modal_block(f, area, 70, 17, title, ACCENT);
+    let kv = |k: &str, v: String, c: Color| {
+        Line::from(vec![
+            Span::styled(format!("{:<12}", k), Style::new().fg(DIM)),
+            Span::styled(v, Style::new().fg(c)),
+        ])
+    };
+    let na = || "n/a".to_string();
+    let lines: Vec<Line> = match report {
+        None => vec![Line::from(vec![
+            Span::styled(
+                format!("{} ", SPINNER[app.tick % SPINNER.len()]),
+                Style::new().fg(ACCENT_SOFT).bold(),
+            ),
+            Span::styled("querying drive health…", Style::new().fg(TEXT)),
+        ])],
+        Some(Err(e)) => vec![
+            Line::from(Span::styled(format!("✗ {e}"), Style::new().fg(ERR_C))),
+            Line::default(),
+            Line::from(Span::styled("Esc to close", Style::new().fg(DIM))),
+        ],
+        Some(Ok(h)) => {
+            let health_c = if h.health == "Healthy" { OK_C } else { ERR_C };
+            let media = if h.spindle > 0 {
+                format!("{} · {} rpm", h.media, h.spindle)
+            } else {
+                h.media.clone()
+            };
+            let mut v = vec![
+                kv("Health", if h.health.is_empty() { na() } else { h.health.clone() }, health_c),
+                kv("Media", if media.is_empty() { na() } else { media }, TEXT),
+                kv("Usage", if h.usage.is_empty() { na() } else { h.usage.clone() }, TEXT),
+                Line::default(),
+                Line::from(Span::styled(
+                    "SMART / reliability counters",
+                    Style::new().fg(ACCENT_SOFT).bold(),
+                )),
+            ];
+            if h.rc_ok {
+                let wear_c = if h.wear >= 90 { ERR_C } else if h.wear >= 70 { WARN_C } else { OK_C };
+                let temp_c = if h.temp >= 70 { ERR_C } else if h.temp >= 55 { WARN_C } else { OK_C };
+                v.push(kv(
+                    "Wear",
+                    if h.wear < 0 { na() } else { format!("{} % of rated endurance used", h.wear) },
+                    if h.wear < 0 { DIM } else { wear_c },
+                ));
+                v.push(kv(
+                    "Temperature",
+                    if h.temp < 0 {
+                        na()
+                    } else if h.temp_max > 0 {
+                        format!("{} °C  (max recorded {} °C)", h.temp, h.temp_max)
+                    } else {
+                        format!("{} °C", h.temp)
+                    },
+                    if h.temp < 0 { DIM } else { temp_c },
+                ));
+                v.push(kv(
+                    "Power-on",
+                    if h.hours < 0 {
+                        na()
+                    } else {
+                        format!("{} h  (~{:.1} years)", h.hours, h.hours as f64 / 8760.0)
+                    },
+                    if h.hours < 0 { DIM } else { TEXT },
+                ));
+                let err_c = |n: i64| if n < 0 { DIM } else if n > 0 { WARN_C } else { OK_C };
+                v.push(kv(
+                    "Read errors",
+                    if h.read_err < 0 { na() } else { h.read_err.to_string() },
+                    err_c(h.read_err),
+                ));
+                v.push(kv(
+                    "Write errors",
+                    if h.write_err < 0 { na() } else { h.write_err.to_string() },
+                    err_c(h.write_err),
+                ));
+            } else if !app.elevated {
+                v.push(Line::from(Span::styled(
+                    "Detailed counters require an elevated (administrator) terminal — restart the app elevated for wear, temperature and error data.",
+                    Style::new().fg(WARN_C),
+                )));
+            } else {
+                v.push(Line::from(Span::styled(
+                    "Detailed counters unavailable for this device. USB enclosures usually block SMART passthrough — connect the drive directly (SATA/NVMe) for wear, temperature and error data.",
+                    Style::new().fg(DIM),
+                )));
+            }
+            v.push(Line::default());
+            v.push(Line::from(Span::styled("Esc close · c copy log", Style::new().fg(DIM))));
+            v
+        }
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 21, "Help", ACCENT);
+    let inner = modal_block(f, area, 74, 22, "Help", ACCENT);
     let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
@@ -656,7 +800,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("f", "format — Windows, macOS, Linux, PS5 or Universal preset"),
         key("e", "erase — quick (partition table) or secure (zero-fill)"),
         key("i", "write a bootable .iso/.img image to the disk (verified)"),
-        key("b", "benchmark & capacity tests (read-only or destructive)"),
+        key("b", "benchmark, surface scan & capacity tests"),
+        key("h", "drive health: SMART wear, temperature, hours, error counts"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),
         key("u", "toggle safety override — allow protected disks (DANGEROUS)"),

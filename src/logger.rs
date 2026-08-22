@@ -27,16 +27,31 @@ fn with<R>(f: impl FnOnce(&mut Logger) -> R) -> R {
     f(&mut guard)
 }
 
+/// Keep the append-only log bounded: once it passes 5 MiB, park it as
+/// `diskutility.log.1` (replacing any previous backup) and start fresh.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+fn rotate(p: &PathBuf) {
+    if std::fs::metadata(p).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        let backup = p.with_extension("log.1");
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::rename(p, &backup);
+    }
+}
+
 fn pick_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("diskutility.log");
+            rotate(&p);
             if OpenOptions::new().create(true).append(true).open(&p).is_ok() {
                 return Some(p);
             }
         }
     }
-    Some(std::env::temp_dir().join("diskutility.log"))
+    let p = std::env::temp_dir().join("diskutility.log");
+    rotate(&p);
+    Some(p)
 }
 
 pub fn init(version: &str, elevated: bool) {
@@ -95,13 +110,14 @@ pub fn copy_to_clipboard() -> Result<usize, String> {
     std::fs::write(&tmp, text.as_bytes()).map_err(|e| format!("temp file write failed: {e}"))?;
     let cmd = format!(
         "Get-Content -Raw -Encoding UTF8 '{}' | Set-Clipboard",
-        tmp.display()
+        crate::ops::ps_quote(&tmp.display().to_string())
     );
-    let out = Command::new("powershell")
+    let out = Command::new(crate::ops::powershell_exe())
         .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("failed to launch powershell: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
     if out.status.success() {
         Ok(count)
     } else {

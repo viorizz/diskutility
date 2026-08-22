@@ -41,6 +41,30 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // `diskutility --health <disk number>` — print SMART/health data and exit
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--health") {
+        let n: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("usage: diskutility --health <disk number>"))?;
+        return match ops::query_health(n) {
+            Ok(h) => {
+                println!("disk {n}: health={} media={} spindle={} usage={}", h.health, h.media, h.spindle, h.usage);
+                if h.rc_ok {
+                    println!("  wear={}% temp={}C (max {}C) power-on={}h read-errors={} write-errors={}",
+                        h.wear, h.temp, h.temp_max, h.hours, h.read_err, h.write_err);
+                } else if !ops::is_elevated() {
+                    println!("  detailed SMART counters require an elevated (administrator) terminal");
+                } else {
+                    println!("  detailed SMART counters unavailable (USB bridge or unsupported device)");
+                }
+                Ok(())
+            }
+            Err(e) => anyhow::bail!("health query failed: {e}"),
+        };
+    }
+
     // Non-interactive mode for quick checks / scripting: `diskutility --list`
     if std::env::args().any(|a| a == "--list" || a == "-l") {
         return list_disks();

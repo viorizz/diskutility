@@ -14,6 +14,7 @@ pub enum AppEvent {
     Disks(Result<Vec<Disk>, String>),
     Op(OpEvent),
     Update(String),
+    Health(Result<ops::HealthReport, String>),
 }
 
 pub enum InputPurpose {
@@ -98,6 +99,7 @@ pub enum Modal {
     Presets { idx: usize },
     EraseMenu { idx: usize },
     TestMenu { idx: usize },
+    Health { title: String, report: Option<Result<ops::HealthReport, String>> },
     Input { purpose: InputPurpose, buf: String },
     Confirm { action: PendingAction, buf: String },
     Progress(ProgressState),
@@ -114,6 +116,8 @@ pub struct App {
     pub status: Option<(String, bool, Instant)>,
     pub tick: usize,
     app_drive: Option<char>,
+    /// Disk snapshotted by `guard()` for the action being configured/confirmed.
+    pending_target: Option<Disk>,
     tx: mpsc::Sender<AppEvent>,
     rx: mpsc::Receiver<AppEvent>,
     quit: bool,
@@ -132,6 +136,7 @@ impl App {
             modal: Modal::None,
             status: None,
             tick: 0,
+            pending_target: None,
             app_drive: std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().and_then(|s| s.chars().next()))
@@ -144,12 +149,20 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         self.refresh();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            if let Ok(Some((tag, _))) = crate::update::check_latest() {
-                let _ = tx.send(AppEvent::Update(tag));
-            }
-        });
+        // Startup update check is the only network access in the TUI; it can
+        // be switched off with --no-update-check or DISKUTILITY_NO_UPDATE_CHECK=1.
+        let opted_out = std::env::args().any(|a| a == "--no-update-check")
+            || std::env::var_os("DISKUTILITY_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0");
+        if opted_out {
+            logger::log("update check skipped (opted out)");
+        } else {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(Some((tag, _))) = crate::update::check_latest() {
+                    let _ = tx.send(AppEvent::Update(tag));
+                }
+            });
+        }
         while !self.quit {
             self.tick = self.tick.wrapping_add(1);
             if let Some((_, _, t)) = &self.status {
@@ -218,6 +231,15 @@ impl App {
                 logger::log(format!("update available: {tag}"));
                 self.update = Some(tag);
             }
+            AppEvent::Health(r) => {
+                match &r {
+                    Ok(h) => logger::log(format!("health: {h:?}")),
+                    Err(e) => logger::log(format!("health query failed: {e}")),
+                }
+                if let Modal::Health { report, .. } = &mut self.modal {
+                    *report = Some(r);
+                }
+            }
         }
     }
 
@@ -275,17 +297,48 @@ impl App {
         reasons
     }
 
-    /// The phrase the user must type to confirm an action on the selected disk.
-    /// Protected disks (with the override active) demand a scarier phrase.
+    /// The disk a pending destructive action will run on: the snapshot taken
+    /// when the user entered the menu, not whatever the list currently shows.
+    pub fn target_disk(&self) -> Option<&Disk> {
+        self.pending_target.as_ref()
+    }
+
+    /// Internal (non-removable) disks are the classic wrong-pick: a data SSD
+    /// sitting next to the USB stick you meant. They aren't blocked, but they
+    /// get the long confirmation phrase and a warning in the dialog.
+    pub fn internal_bus_warning(disk: &Disk) -> Option<String> {
+        let removable = matches!(
+            disk.bus.to_ascii_uppercase().as_str(),
+            "USB" | "SD" | "MMC" | "1394" | "VIRTUAL" | "FILE BACKED VIRTUAL"
+        );
+        if removable {
+            None
+        } else {
+            Some(format!(
+                "not a removable device (bus {})",
+                if disk.bus.is_empty() { "unknown" } else { &disk.bus }
+            ))
+        }
+    }
+
+    /// The phrase the user must type to confirm an action on the target disk.
+    /// Protected disks (with the override active) and internal disks demand
+    /// the scarier phrase.
     pub fn confirm_phrase(&self) -> String {
-        match self.selected_disk() {
-            Some(d) if !self.protection_reasons(d).is_empty() => format!("DESTROY {}", d.number),
+        match self.target_disk() {
+            Some(d)
+                if !self.protection_reasons(d).is_empty()
+                    || Self::internal_bus_warning(d).is_some() =>
+            {
+                format!("DESTROY {}", d.number)
+            }
             Some(d) => d.number.to_string(),
             None => String::new(),
         }
     }
 
-    /// Returns true if a destructive action is allowed on the selected disk.
+    /// Returns true if a destructive action is allowed on the selected disk,
+    /// and snapshots that disk as the pending target.
     fn guard(&mut self) -> bool {
         let Some(disk) = self.selected_disk() else {
             self.error("no disk selected");
@@ -304,7 +357,13 @@ impl App {
             self.error("administrator rights required — restart this app from an elevated terminal");
             return false;
         }
+        self.pending_target = self.selected_disk().cloned();
         true
+    }
+
+    /// True when two scan results describe the same physical device.
+    fn same_device(a: &Disk, b: &Disk) -> bool {
+        a.number == b.number && a.serial == b.serial && a.size == b.size && a.name == b.name
     }
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -385,20 +444,21 @@ impl App {
             Modal::TestMenu { mut idx } => match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Up | KeyCode::Char('k') => {
-                    idx = (idx + 3) % 4;
+                    idx = (idx + 4) % 5;
                     self.modal = Modal::TestMenu { idx };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    idx = (idx + 1) % 4;
+                    idx = (idx + 1) % 5;
                     self.modal = Modal::TestMenu { idx };
                 }
                 KeyCode::Enter => match idx {
-                    0 => self.start_read_bench(),
+                    0 => self.start_safe_test(false),
+                    1 => self.start_safe_test(true),
                     _ => {
                         if self.guard() {
                             let action = match idx {
-                                1 => PendingAction::BenchFull,
-                                2 => PendingAction::Capacity { full: false },
+                                2 => PendingAction::BenchFull,
+                                3 => PendingAction::Capacity { full: false },
                                 _ => PendingAction::Capacity { full: true },
                             };
                             self.modal = Modal::Confirm { action, buf: String::new() };
@@ -406,6 +466,14 @@ impl App {
                     }
                 },
                 _ => self.modal = Modal::TestMenu { idx },
+            },
+            Modal::Health { title, report } => match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('h') => {}
+                KeyCode::Char('c') => {
+                    self.copy_log();
+                    self.modal = Modal::Health { title, report };
+                }
+                _ => self.modal = Modal::Health { title, report },
             },
             Modal::Input { purpose, mut buf } => match k.code {
                 KeyCode::Esc => {}
@@ -537,6 +605,15 @@ impl App {
                     self.error("no disk selected");
                 }
             }
+            KeyCode::Char('h') => {
+                if let Some(disk) = self.selected_disk() {
+                    let title = format!("Health — disk {} · {}", disk.number, disk.name);
+                    ops::spawn_health(self.tx.clone(), disk.number);
+                    self.modal = Modal::Health { title, report: None };
+                } else {
+                    self.error("no disk selected");
+                }
+            }
             _ => {}
         }
     }
@@ -559,7 +636,7 @@ impl App {
         if !matches!(ext.as_str(), "iso" | "img" | "raw" | "bin" | "wic") {
             return Err(format!("unsupported extension '.{ext}' — expected .iso, .img, .raw, .bin or .wic"));
         }
-        let disk = self.selected_disk().ok_or("no disk selected")?;
+        let disk = self.target_disk().ok_or("no disk selected")?;
         if meta.len() > disk.size {
             return Err(format!(
                 "image ({}) is larger than disk {} ({})",
@@ -568,17 +645,70 @@ impl App {
                 disks::human(disk.size)
             ));
         }
+        // The image must not live on the disk we are about to wipe: the prep
+        // step would destroy its volume and the write would fail half-way,
+        // taking the image with it.
+        let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let image_drive = resolved
+            .to_str()
+            .map(|s| s.trim_start_matches(r"\\?\").to_string())
+            .and_then(|s| {
+                let mut it = s.chars();
+                match (it.next(), it.next()) {
+                    (Some(c), Some(':')) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
+                    _ => None,
+                }
+            });
+        match image_drive {
+            Some(drive) => {
+                let on_target = disk.partitions.iter().any(|p| {
+                    p.letter.chars().next().map(|c| c.to_ascii_uppercase()) == Some(drive)
+                });
+                if on_target {
+                    return Err(format!(
+                        "the image is stored on disk {} ({drive}:) — it would be destroyed while being written. Move it to another drive first.",
+                        disk.number
+                    ));
+                }
+            }
+            // UNC paths (\\server\share, canonicalized to \\?\UNC\...) are by
+            // definition not on a local disk; anything else we can't place
+            // (volume-GUID paths) is refused rather than guessed.
+            None if resolved.to_string_lossy().contains(r"\UNC\")
+                || resolved.to_string_lossy().starts_with(r"\\") && !resolved.to_string_lossy().starts_with(r"\\?\") => {}
+            None => {
+                return Err("image path must be a drive-letter path (e.g. D:\\images\\x.iso) or a UNC share path — volume-GUID paths are not supported".into());
+            }
+        }
         Ok((path, meta.len()))
     }
 
     fn start_action(&mut self, action: PendingAction) {
-        let Some(disk) = self.selected_disk().cloned() else {
-            self.error("no disk selected");
+        let Some(disk) = self.target_disk().cloned() else {
+            self.error("no target disk — select a disk and start again");
             return;
         };
+        // The disk list may have been refreshed while the dialog was open (a
+        // scan finishing, a drive unplugged): make sure the highlighted row is
+        // still the device the user confirmed before running anything.
+        match self.selected_disk() {
+            Some(current) if Self::same_device(current, &disk) => {}
+            _ => {
+                self.pending_target = None;
+                self.error(format!(
+                    "the disk list changed since you selected disk {} — nothing was touched. Re-select the disk and retry.",
+                    disk.number
+                ));
+                return;
+            }
+        }
         // belt-and-braces: protected disks always require the explicit override
-        if disk.is_protected() && !self.unlocked {
-            self.error("refusing to touch the Windows system/boot disk (press u to override)");
+        if !self.protection_reasons(&disk).is_empty() && !self.unlocked {
+            self.error("refusing to touch a protected disk (press u to override)");
+            return;
+        }
+        if !self.elevated {
+            self.error("administrator rights required — restart this app from an elevated terminal");
             return;
         }
         let allow_protected = self.unlocked;
@@ -633,9 +763,10 @@ impl App {
         self.modal = Modal::Progress(progress);
     }
 
-    /// Read benchmark is non-destructive, so it skips the confirm dialog and
-    /// is allowed even on protected disks — it only needs elevation.
-    fn start_read_bench(&mut self) {
+    /// Read benchmark and surface scan are non-destructive, so they skip the
+    /// confirm dialog and are allowed even on protected disks — they only
+    /// need elevation.
+    fn start_safe_test(&mut self, surface_scan: bool) {
         if !self.elevated {
             self.error("administrator rights required — restart this app from an elevated terminal");
             return;
@@ -644,15 +775,20 @@ impl App {
             self.error("no disk selected");
             return;
         };
+        let what = if surface_scan { "surface scan" } else { "read benchmark" };
         logger::log(format!(
-            "action start: read benchmark — target disk {} · {} · {}",
+            "action start: {what} — target disk {} · {} · {}",
             disk.number,
             disk.name,
             disks::human(disk.size)
         ));
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = ProgressState {
-            title: format!("Read benchmark — disk {}", disk.number),
+            title: format!(
+                "{} — disk {}",
+                if surface_scan { "Surface scan" } else { "Read benchmark" },
+                disk.number
+            ),
             pct: None,
             detail: String::new(),
             samples: Vec::new(),
@@ -667,7 +803,11 @@ impl App {
             cancel: cancel.clone(),
             cancellable: true,
         };
-        crate::bench::spawn_read_bench(self.tx.clone(), disk, cancel);
+        if surface_scan {
+            crate::bench::spawn_surface_scan(self.tx.clone(), disk, cancel);
+        } else {
+            crate::bench::spawn_read_bench(self.tx.clone(), disk, cancel);
+        }
         self.modal = Modal::Progress(progress);
     }
 }

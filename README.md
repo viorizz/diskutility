@@ -79,6 +79,22 @@ diskutility --update
   session by typing `UNLOCK` in a warning dialog. The header turns red with a
   `⛨ PROTECTIONS OFF` badge, and acting on a protected disk then requires
   typing `DESTROY <disk number>` to confirm. Press `u` again to re-lock.
+- **Internal (non-USB/SD) disks** are not blocked, but the confirmation dialog
+  flags them and demands the `DESTROY <n>` phrase, and lists the volumes and
+  used space on the target so a wrong pick is obvious.
+- **Device identity is re-checked** right before anything is written: the
+  target's serial number, size and model must still match what you confirmed.
+  Disk numbers shift when drives are plugged/unplugged; if the list changed
+  under you, the operation is refused and nothing is touched.
+- An image that lives on the disk being written is refused.
+- PowerShell is always launched by absolute path (`%SystemRoot%\System32\...`)
+  with `-NoProfile` and a module path pinned to system directories, and every
+  script receives only integers and quoted/sanitized strings.
+- `diskutility --update` downloads only from this repository's GitHub
+  releases, verifies the SHA-256 against the release's `checksums.txt`, and
+  checks the new binary runs before swapping it in. The start-up update check
+  is the TUI's only network access; disable it with `--no-update-check` or
+  `DISKUTILITY_NO_UPDATE_CHECK=1`.
 
 ## Build & run
 

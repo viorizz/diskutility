@@ -18,5 +18,7 @@ jobs:
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
+      - name: Unit tests
+        run: cargo test --release
       - name: Smoke test
         run: cargo run --release -- --version

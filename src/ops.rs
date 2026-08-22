@@ -106,9 +106,27 @@ pub fn run_ps_quiet(script: &str) -> Result<String, String> {
 }
 
 /// Prepended to every script: silence progress records (they pollute stderr
-/// as CLIXML) and force UTF-8 output so unicode survives the pipe.
-const PS_PRELUDE: &str =
-    "$ProgressPreference='SilentlyContinue'\ntry { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}\n";
+/// as CLIXML), force UTF-8 output so unicode survives the pipe, and pin the
+/// module search path to system-owned directories so a module dropped in the
+/// user's Documents folder can't shadow the Storage cmdlets while we run
+/// elevated.
+const PS_PRELUDE: &str = "$ProgressPreference='SilentlyContinue'\n\
+    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}\n\
+    $env:PSModulePath = \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\Modules;$env:ProgramFiles\\WindowsPowerShell\\Modules\"\n";
+
+/// Absolute path of Windows PowerShell. `Command::new("powershell")` would
+/// search the directory of our own exe first — which is user-writable when
+/// installed to %LOCALAPPDATA% — and we usually run elevated, so never resolve
+/// the interpreter by name.
+pub fn powershell_exe() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// Escape a value for use inside a single-quoted PowerShell string literal.
+pub fn ps_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
 
 fn run_ps_impl(script: &str, verbose: bool) -> Result<String, String> {
     if verbose {
@@ -118,7 +136,7 @@ fn run_ps_impl(script: &str, verbose: bool) -> Result<String, String> {
     let utf16: Vec<u8> = full_script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let encoded = B64.encode(&utf16);
     let started = Instant::now();
-    let out = Command::new("powershell")
+    let out = Command::new(powershell_exe())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -208,6 +226,65 @@ fn decode_clixml(s: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HealthReport {
+    #[serde(default)]
+    pub health: String,
+    #[serde(default)]
+    pub media: String,
+    #[serde(default)]
+    pub spindle: u32,
+    #[serde(default)]
+    pub usage: String,
+    #[serde(default)]
+    pub rc_ok: bool,
+    #[serde(default)]
+    pub wear: i64,
+    #[serde(default)]
+    pub temp: i64,
+    #[serde(default)]
+    pub temp_max: i64,
+    #[serde(default)]
+    pub hours: i64,
+    #[serde(default)]
+    pub read_err: i64,
+    #[serde(default)]
+    pub write_err: i64,
+}
+
+pub fn query_health(n: u32) -> Result<HealthReport, String> {
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$n = {n}
+$pd = Get-PhysicalDisk | Where-Object {{ $_.DeviceId -eq $n }} | Select-Object -First 1
+if (-not $pd) {{ throw 'no physical-disk information available for this device' }}
+$rc = $null
+try {{ $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop }} catch {{}}
+$o = [pscustomobject]@{{
+  health = [string]$pd.HealthStatus
+  media  = [string]$pd.MediaType
+  spindle = [uint32]$pd.SpindleSpeed
+  usage  = [string]$pd.Usage
+  rc_ok  = [bool]($null -ne $rc)
+  wear   = if ($rc -and $null -ne $rc.Wear) {{ [int64]$rc.Wear }} else {{ -1 }}
+  temp   = if ($rc -and $rc.Temperature -gt 0) {{ [int64]$rc.Temperature }} else {{ -1 }}
+  temp_max = if ($rc -and $rc.TemperatureMax -gt 0) {{ [int64]$rc.TemperatureMax }} else {{ -1 }}
+  hours  = if ($rc -and $null -ne $rc.PowerOnHours) {{ [int64]$rc.PowerOnHours }} else {{ -1 }}
+  read_err = if ($rc -and $null -ne $rc.ReadErrorsTotal) {{ [int64]$rc.ReadErrorsTotal }} else {{ -1 }}
+  write_err = if ($rc -and $null -ne $rc.WriteErrorsTotal) {{ [int64]$rc.WriteErrorsTotal }} else {{ -1 }}
+}}
+ConvertTo-Json -InputObject $o -Compress"#
+    );
+    let out = run_ps(&script)?;
+    serde_json::from_str(out.trim()).map_err(|e| format!("could not parse health data: {e}"))
+}
+
+pub fn spawn_health(tx: Sender<AppEvent>, n: u32) {
+    thread::spawn(move || {
+        let _ = tx.send(AppEvent::Health(query_health(n)));
+    });
+}
+
 pub fn is_elevated() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
@@ -238,18 +315,38 @@ pub fn is_elevated() -> bool {
 /// write-protection (Set-Disk, falling back to diskpart), bring it online,
 /// and wipe existing partitions — leaving it RAW. Every step narrates via
 /// Write-Output so the log shows exactly how far it got.
-fn prep_prelude(n: u32, allow_protected: bool) -> String {
+fn prep_prelude(disk: &Disk, allow_protected: bool) -> String {
+    let n = disk.number;
     let protect_line = if allow_protected {
         "Write-Output 'prep: SAFETY OVERRIDE ACTIVE - system/boot protection bypassed by user'"
     } else {
         "if ($d.IsBoot -or $d.IsSystem) { throw 'refusing to touch the Windows system disk' }"
     };
+    // Identity check: disk numbers are reassigned when devices are plugged or
+    // unplugged, so the number the user confirmed may now name a different
+    // device. Compare the live disk against the snapshot that was confirmed and
+    // refuse if anything that identifies the hardware has changed.
+    let identity = format!(
+        "$expSerial = '{serial}'\n\
+         $expSize = [uint64]{size}\n\
+         $expName = '{name}'\n\
+         $liveSerial = ([string]$d.SerialNumber).Trim()\n\
+         $liveName = ([string]$d.FriendlyName).Trim()\n\
+         if ([uint64]$d.Size -ne $expSize -or ($expName -ne '' -and $liveName -ne $expName) -or ($expSerial -ne '' -and $liveSerial -ne $expSerial)) {{\n\
+           throw \"disk $n is no longer the device you confirmed (expected '$expName' serial '$expSerial' $expSize bytes, found '$liveName' serial '$liveSerial' $($d.Size) bytes). Disk numbers change when drives are plugged or unplugged - rescan (r) and retry.\"\n\
+         }}\n\
+         Write-Output 'prep: disk identity verified'",
+        serial = ps_quote(&disk.serial),
+        size = disk.size,
+        name = if disk.name == crate::disks::UNKNOWN_NAME { String::new() } else { ps_quote(&disk.name) },
+    );
     format!(
         r#"$ErrorActionPreference='Stop'
 $ConfirmPreference='None'
 $n = {n}
 $d = Get-Disk -Number $n
 Write-Output "prep: disk $n · style=$($d.PartitionStyle) · readonly=$($d.IsReadOnly) · offline=$($d.IsOffline) · offlineReason=$($d.OfflineReason) · health=$($d.HealthStatus) · bus=$($d.BusType) · size=$($d.Size)"
+{identity}
 {protect_line}
 if ($d.IsReadOnly) {{
   Write-Output 'prep: disk reports write-protected - clearing with Set-Disk'
@@ -281,8 +378,8 @@ Write-Output 'prep: disk ready (RAW, writable, online)'
 }
 
 /// Run the prep script and mirror its narration lines into the UI log.
-pub fn run_prep(tx: &Sender<AppEvent>, n: u32, allow_protected: bool) -> Result<(), String> {
-    let out = run_ps(&prep_prelude(n, allow_protected))?;
+pub fn run_prep(tx: &Sender<AppEvent>, disk: &Disk, allow_protected: bool) -> Result<(), String> {
+    let out = run_ps(&prep_prelude(disk, allow_protected))?;
     for l in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
         log(tx, l.to_string());
     }
@@ -337,7 +434,7 @@ fn do_format(
     }
 
     log(tx, "Step 1/3 — prepare disk (write-protection, online, wipe old partitions)…");
-    run_prep(tx, disk.number, allow_protected)?;
+    run_prep(tx, disk, allow_protected)?;
 
     log(tx, format!("Step 2/3 — initialize {scheme}, create partition…"));
     let script = format!(
@@ -425,7 +522,7 @@ try {{
   wsl.exe --unmount \\.\PHYSICALDRIVE{n} *> $null
 }}
 'OK'"#,
-        prep = prep_prelude(n, allow_protected),
+        prep = prep_prelude(disk, allow_protected),
     );
     let out = run_ps(&script)?;
     for l in out.lines().map(str::trim).filter(|l| !l.is_empty() && *l != "OK") {
@@ -444,7 +541,7 @@ pub fn spawn_erase_quick(tx: Sender<AppEvent>, disk: Disk, allow_protected: bool
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
             log(&tx, "Removing partition table and filesystem structures…");
-            run_prep(&tx, disk.number, allow_protected)?;
+            run_prep(&tx, &disk, allow_protected)?;
             Ok(format!("Disk {} erased — it is now blank (RAW/uninitialized).", disk.number))
         })();
         done(&tx, result);
@@ -460,7 +557,7 @@ pub fn spawn_zero_fill(
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
             log(&tx, "Preparing disk (write-protection, wipe partitions)…");
-            run_prep(&tx, disk.number, allow_protected)?;
+            run_prep(&tx, &disk, allow_protected)?;
             log(&tx, format!("Overwriting all {} with zeros — every sector, start to end…", human(disk.size)));
             let mut dev = open_physical(disk.number)?;
             log(&tx, format!(r"raw device \\.\PHYSICALDRIVE{} opened for writing", disk.number));
@@ -517,7 +614,7 @@ pub fn spawn_write_iso(
                 ));
             }
             log(&tx, "Preparing disk (write-protection, wipe partitions)…");
-            run_prep(&tx, disk.number, allow_protected)?;
+            run_prep(&tx, &disk, allow_protected)?;
             log(&tx, "Writing image sector-by-sector…");
             let mut src = File::open(&path).map_err(|e| format!("cannot open image: {e}"))?;
             let mut dev = open_physical(disk.number)?;
@@ -636,6 +733,10 @@ pub fn progress_with(tx: &Sender<AppEvent>, done_bytes: u64, total: u64, start: 
     let frac = if total == 0 { 1.0 } else { done_bytes as f64 / total as f64 };
     let _ = tx.send(AppEvent::Op(OpEvent::Sample(speed as u64)));
     let _ = tx.send(AppEvent::Op(OpEvent::Progress(frac, detail)));
+}
+
+pub fn fmt_secs_pub(secs: f64) -> String {
+    fmt_secs(secs)
 }
 
 fn fmt_secs(secs: f64) -> String {

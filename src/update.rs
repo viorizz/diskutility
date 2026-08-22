@@ -35,29 +35,56 @@ pub fn check_latest() -> Result<Option<(String, String)>, String> {
     }
 }
 
-/// Download the latest release and swap it in over the running executable
-/// (Windows allows renaming a running exe, just not deleting it — the old
-/// version is parked as *.old and removed on next start).
+/// Only ever install binaries published under this repository's releases.
+fn allowed_url(url: &str) -> bool {
+    url.starts_with(&format!("https://github.com/{REPO}/releases/download/"))
+        && !url.contains('\'')
+        && !url.contains(char::is_whitespace)
+}
+
+/// Download the latest release, verify it against the release's
+/// `checksums.txt`, sanity-check it, then swap it in over the running
+/// executable (Windows allows renaming a running exe, just not deleting it —
+/// the old version is parked as *.old and removed on next start).
 pub fn self_update() -> Result<String, String> {
     let current = env!("CARGO_PKG_VERSION");
     logger::log("update: checking latest release");
     let Some((tag, url)) = check_latest()? else {
         return Ok(format!("diskutility v{current} is already the latest version."));
     };
+    if !allowed_url(&url) {
+        return Err(format!("refusing to download from unexpected location: {url}"));
+    }
+    let Some(base) = url.rsplit_once('/').map(|(b, _)| b) else {
+        return Err("malformed download url".into());
+    };
+    let sums_url = format!("{base}/checksums.txt");
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate own exe: {e}"))?;
     let staged = exe.with_extension("exe.new");
     let backup = exe.with_extension("exe.old");
     logger::log(format!("update: downloading {tag} from {url}"));
-    ops::run_ps(&format!(
-        "Invoke-WebRequest -Uri '{url}' -OutFile '{}' -UseBasicParsing",
-        staged.display()
-    ))?;
-    let size = std::fs::metadata(&staged)
-        .map_err(|e| format!("download missing: {e}"))?
-        .len();
-    if size < 200_000 {
+    let out = ops::run_ps(&format!(
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+         Invoke-WebRequest -Uri '{url}' -OutFile '{staged}' -UseBasicParsing
+         $sums = (Invoke-WebRequest -Uri '{sums}' -UseBasicParsing).Content
+         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath '{staged}').Hash.ToLower()
+         Write-Output \"HASH:$hash\"
+         Write-Output 'SUMS:'
+         Write-Output $sums",
+        url = ops::ps_quote(&url),
+        sums = ops::ps_quote(&sums_url),
+        staged = ops::ps_quote(&staged.display().to_string()),
+    ));
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+    };
+    if let Err(e) = verify_download(&out, &staged) {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!("downloaded file is suspiciously small ({size} bytes) — aborting"));
+        return Err(e);
     }
     let _ = std::fs::remove_file(&backup);
     std::fs::rename(&exe, &backup).map_err(|e| format!("cannot move current exe aside: {e}"))?;
@@ -67,13 +94,99 @@ pub fn self_update() -> Result<String, String> {
     }
     logger::log(format!("update: installed {tag}"));
     Ok(format!(
-        "Updated v{current} → {tag}. Restart diskutility to run the new version."
+        "Updated v{current} → {tag} (SHA-256 verified). Restart diskutility to run the new version."
     ))
+}
+
+/// Check the staged download: expected hash listed in checksums.txt, actual
+/// hash matches, it is a PE image, and it identifies itself as diskutility.
+fn verify_download(ps_out: &str, staged: &std::path::Path) -> Result<(), String> {
+    let actual = ps_out
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("HASH:"))
+        .ok_or("download did not produce a hash")?
+        .to_ascii_lowercase();
+    let sums_start = ps_out.find("SUMS:").ok_or("checksums.txt was not fetched")?;
+    let expected = ps_out[sums_start + 5..]
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| {
+            let (h, name) = l.split_once(char::is_whitespace)?;
+            (name.trim().trim_start_matches('*') == "diskutility.exe").then(|| h.to_ascii_lowercase())
+        })
+        .next()
+        .ok_or("checksums.txt has no entry for diskutility.exe — refusing to install an unverified binary")?;
+    if expected.len() != 64 || actual.len() != 64 {
+        return Err("malformed SHA-256 in checksums.txt".into());
+    }
+    if expected != actual {
+        logger::log(format!("update: CHECKSUM MISMATCH expected {expected} got {actual}"));
+        return Err("SHA-256 of the downloaded file does not match checksums.txt — download corrupted or tampered; aborting".into());
+    }
+    logger::log(format!("update: sha256 verified {actual}"));
+    let size = std::fs::metadata(staged)
+        .map_err(|e| format!("download missing: {e}"))?
+        .len();
+    if size < 200_000 {
+        return Err(format!("downloaded file is suspiciously small ({size} bytes) — aborting"));
+    }
+    let mut head = [0u8; 2];
+    std::fs::File::open(staged)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .map_err(|e| format!("cannot read download: {e}"))?;
+    if &head != b"MZ" {
+        return Err("downloaded file is not a Windows executable — aborting".into());
+    }
+    let probe = std::process::Command::new(staged)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("new binary failed to start: {e}"))?;
+    let banner = String::from_utf8_lossy(&probe.stdout);
+    if !probe.status.success() || !banner.starts_with("diskutility v") {
+        return Err(format!("new binary did not identify itself as diskutility ({})", banner.trim()));
+    }
+    logger::log(format!("update: new binary reports '{}'", banner.trim()));
+    Ok(())
 }
 
 /// Remove the parked previous version left behind by a self-update.
 pub fn cleanup() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_release_assets_from_our_repo_are_allowed() {
+        assert!(allowed_url("https://github.com/viorizz/diskutility/releases/download/v1.0.0/diskutility.exe"));
+        assert!(!allowed_url("https://github.com/evil/diskutility/releases/download/v1.0.0/diskutility.exe"));
+        assert!(!allowed_url("http://github.com/viorizz/diskutility/releases/download/v1.0.0/diskutility.exe"));
+        assert!(!allowed_url("https://github.com/viorizz/diskutility/releases/download/v1'; Remove-Item x; '/a.exe"));
+    }
+
+    #[test]
+    fn checksum_mismatch_is_rejected_before_touching_the_file() {
+        let out = format!("HASH:{}\nSUMS:\n{}  diskutility.exe\n", "a".repeat(64), "b".repeat(64));
+        let err = verify_download(&out, std::path::Path::new("does-not-exist.exe")).unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn missing_checksum_entry_is_rejected() {
+        let out = format!("HASH:{}\nSUMS:\n{}  other.exe\n", "a".repeat(64), "a".repeat(64));
+        let err = verify_download(&out, std::path::Path::new("does-not-exist.exe")).unwrap_err();
+        assert!(err.contains("no entry"), "{err}");
+    }
+
+    #[test]
+    fn matching_checksum_proceeds_to_file_checks() {
+        let out = format!("HASH:{}\nSUMS:\n{}  diskutility.exe\n", "a".repeat(64), "A".repeat(64));
+        let err = verify_download(&out, std::path::Path::new("does-not-exist.exe")).unwrap_err();
+        assert!(err.contains("download missing"), "{err}");
     }
 }
