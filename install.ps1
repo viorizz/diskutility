@@ -21,6 +21,8 @@ $exe = Join-Path $dir 'diskutility.exe'
 $staged = "$exe.new"
 Invoke-WebRequest $asset.browser_download_url -OutFile $staged -UseBasicParsing
 $sumText = (Invoke-WebRequest $sums.browser_download_url -UseBasicParsing).Content
+# GitHub serves assets as application/octet-stream, so .Content is a byte[] not a string.
+if ($sumText -is [byte[]]) { $sumText = [Text.Encoding]::UTF8.GetString($sumText) }
 $want = ($sumText -split "`n" | Where-Object { $_ -match 'diskutility\.exe' } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
 $have = (Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash
 if (-not $want -or $want.ToLower() -ne $have.ToLower()) {

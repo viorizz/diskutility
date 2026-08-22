@@ -6,6 +6,26 @@ body, so **every release must have its section here before the tag is pushed**
 (the workflow fails otherwise). GitHub's auto-generated "Full Changelog"
 comparison link is appended below these notes.
 
+## v0.4.7 — 2026-08-22
+
+### Fixed
+- **`--update` / `Shift+U` failed with "checksums.txt has no entry for diskutility.exe"** even though the release's `checksums.txt` was correct. GitHub serves release assets as `application/octet-stream`, so PowerShell's `Invoke-WebRequest ... .Content` returned the file as a `byte[]`; written to the pipe, that became one integer per line and the SHA-256 parser found no `diskutility.exe` entry. The updater now decodes the bytes as UTF-8 before parsing. `install.ps1` had the same latent bug and is fixed the same way — use it (or `winget upgrade`) to get past v0.4.6, since the old binary cannot self-update.
+
+## v0.4.7 — 2026-08-22
+
+### Added
+- **Manage menu (`m`)** — quick, non-destructive actions for the selected disk, each run with the same disk-identity check as every other operation and reported in the progress dialog:
+  - **Assign or change a drive letter** for any partition with a filesystem. The prompt lists the letters that are actually free (it also excludes mapped network drives, which `Get-Volume` would miss) and refuses A–C and letters in use.
+  - **Remove a drive letter** — the volume is unmounted but its data is untouched; assign a letter again to use it.
+  - **Rename a volume label** (characters invalid in labels are stripped; 32-character cap, FAT32's 11-character limit is left to Windows to report).
+  - **Bring online / take offline** — an offline disk is left alone by Windows (no automount, no indexing), which is the safe state for a drive you are about to image or hand to another machine.
+  - **Safely eject** — flushes and ejects through the shell's *Eject* verb (the same thing as the tray icon) and tells you when a program is still holding the drive open. A disk without any drive letter is taken offline instead, which also flushes it.
+  - **Clear the read-only flag** (`Set-Disk -IsReadOnly $false`), with a pointer to the enclosure diagnostics when the device refuses.
+  The system/boot disk and the disk hosting the app are refused unless the safety override is on; the menu needs an elevated terminal.
+
+### Changed
+- Footer shows `m  manage`; Help gained a line for it.
+
 ## v0.4.6 — 2026-08-22
 
 ### Added

@@ -1022,3 +1022,116 @@ fn fmt_secs(secs: f64) -> String {
         format!("{s}s")
     }
 }
+
+// ---------------------------------------------------------------------------
+// Manage (m): quick non-destructive disk/volume operations
+// ---------------------------------------------------------------------------
+
+/// Quick operations that change how Windows presents a disk without
+/// touching its data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManageOp {
+    /// Assign or change the drive letter of a partition.
+    SetLetter { partition: u32, letter: char },
+    /// Remove the drive letter of a partition (volume stays intact, unmounted).
+    RemoveLetter { partition: u32, letter: char },
+    /// Rename the volume label of a lettered partition.
+    SetLabel { letter: char, label: String },
+    Online,
+    Offline,
+    /// Safely eject (flush + surprise-removal-safe) via the shell; falls back
+    /// to taking the disk offline when no volume has a letter.
+    Eject { letter: Option<char> },
+    ClearReadOnly,
+}
+
+impl ManageOp {
+    pub fn title(&self, disk: u32) -> String {
+        match self {
+            ManageOp::SetLetter { partition, letter } => format!("Disk {disk} · partition {partition} → {letter}:"),
+            ManageOp::RemoveLetter { partition, letter } => format!("Disk {disk} · removing {letter}: from partition {partition}"),
+            ManageOp::SetLabel { letter, .. } => format!("Disk {disk} · renaming volume {letter}:"),
+            ManageOp::Online => format!("Disk {disk} · bringing online"),
+            ManageOp::Offline => format!("Disk {disk} · taking offline"),
+            ManageOp::Eject { .. } => format!("Disk {disk} · safely ejecting"),
+            ManageOp::ClearReadOnly => format!("Disk {disk} · clearing read-only flag"),
+        }
+    }
+
+    fn script(&self, n: u32) -> String {
+        match self {
+            ManageOp::SetLetter { partition, letter } => format!(
+                "if (Test-Path '{letter}:') {{ throw '{letter}: is already in use' }}\n\
+                 Set-Partition -DiskNumber $n -PartitionNumber {partition} -NewDriveLetter '{letter}'\n\
+                 Write-Output 'partition {partition} is now {letter}:'"
+            ),
+            ManageOp::RemoveLetter { partition, letter } => format!(
+                "Remove-PartitionAccessPath -DiskNumber $n -PartitionNumber {partition} -AccessPath '{letter}:\'\n\
+                 Write-Output 'removed {letter}: (the volume is intact; assign a letter again to use it)'"
+            ),
+            ManageOp::SetLabel { letter, label } => format!(
+                "Set-Volume -DriveLetter '{letter}' -NewFileSystemLabel '{label}'\n\
+                 Write-Output \"volume {letter}: is now labelled '{label}'\"",
+                label = ps_quote(label)
+            ),
+            ManageOp::Online => "Set-Disk -Number $n -IsOffline $false\n\
+                 $d = Get-Disk -Number $n\n\
+                 if ($d.IsOffline) { throw \"disk is still offline (reason: $($d.OfflineReason))\" }\n\
+                 Write-Output 'disk is online'"
+                .into(),
+            ManageOp::Offline => "Set-Disk -Number $n -IsOffline $true\n\
+                 Write-Output 'disk is offline — Windows will not touch it until it is brought online again'"
+                .into(),
+            ManageOp::Eject { letter: Some(l) } => format!(
+                "$vol = (New-Object -ComObject Shell.Application).NameSpace(17).ParseName('{l}:')\n\
+                 if (-not $vol) {{ throw 'the shell cannot see {l}:' }}\n\
+                 $vol.InvokeVerb('Eject')\n\
+                 Start-Sleep -Milliseconds 1500\n\
+                 if (Test-Path '{l}:') {{ throw 'Windows refused to eject — a program is still using the drive (close Explorer windows and apps, then retry)' }}\n\
+                 Write-Output 'ejected — safe to unplug'"
+            ),
+            ManageOp::Eject { letter: None } => "Set-Disk -Number $n -IsOffline $true\n\
+                 Write-Output 'no drive letter to eject through the shell — the disk was taken offline instead, which flushes it; safe to unplug'"
+                .into(),
+            ManageOp::ClearReadOnly => "Set-Disk -Number $n -IsReadOnly $false\n\
+                 Start-Sleep -Milliseconds 400\n\
+                 $d = Get-Disk -Number $n\n\
+                 if ($d.IsReadOnly) { throw 'still read-only after Set-Disk — the device itself may be write-protected (see the format prep diagnostics, or check for a lock switch / enclosure fault)' }\n\
+                 Write-Output 'read-only flag cleared'"
+                .into(),
+        }
+        .replace("$n", &n.to_string())
+    }
+}
+
+/// Run a manage op: identity check first, then the short script. Narration
+/// goes to the progress modal; the result message is the last output line.
+pub fn spawn_manage(tx: Sender<AppEvent>, disk: Disk, op: ManageOp) {
+    thread::spawn(move || {
+        let result = (|| -> Result<String, String> {
+            log(&tx, "Verifying disk identity…");
+            verify_identity(&disk)?;
+            let script = format!(
+                "$ErrorActionPreference='Stop'\n$ConfirmPreference='None'\n{}\nUpdate-HostStorageCache",
+                op.script(disk.number)
+            );
+            let out = run_ps(&script)?;
+            let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            for l in &lines {
+                log(&tx, l.to_string());
+            }
+            Ok(lines.last().map(|s| s.to_string()).unwrap_or_else(|| "done".into()))
+        })();
+        done(&tx, result);
+    });
+}
+
+/// Drive letters not currently in use (includes mapped network drives,
+/// which `Test-Path` sees and `Get-Volume` does not).
+pub fn free_drive_letters() -> Vec<char> {
+    let script = "(([char[]](68..90)) | Where-Object { -not (Test-Path \"$($_):\") }) -join ''";
+    match run_ps_quiet(script) {
+        Ok(out) => out.trim().chars().filter(|c| c.is_ascii_uppercase()).collect(),
+        Err(_) => ('D'..='Z').collect(),
+    }
+}

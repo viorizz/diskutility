@@ -10,7 +10,7 @@ use crate::config::{self, Config, Frequency, Schedule, MONTHS, WEEKDAYS};
 use crate::schedule;
 use crate::disks::{self, Disk};
 use crate::logger;
-use crate::ops::{self, OpEvent, Preset, PRESETS};
+use crate::ops::{self, ManageOp, OpEvent, Preset, PRESETS};
 
 pub enum AppEvent {
     Disks(Result<Vec<Disk>, String>),
@@ -133,6 +133,37 @@ pub enum InputPurpose {
     /// Folder to remember as the default backup destination (`n` key).
     BackupDir,
     CloneTarget,
+    /// New drive letter for a partition (`m` menu). `free` = letters not in use.
+    DriveLetter { partition: u32, free: Vec<char> },
+    /// New label for the volume at `letter` (`m` menu).
+    VolumeLabel { letter: char },
+}
+
+/// One row of the manage menu (`m`).
+#[derive(Clone, Debug)]
+pub enum ManageItem {
+    /// Runs directly.
+    Op(ManageOp),
+    /// Opens the drive-letter prompt.
+    Letter { partition: u32, current: Option<char> },
+    /// Opens the label prompt.
+    Label { letter: char, current: String },
+}
+
+impl ManageItem {
+    pub fn label(&self) -> String {
+        match self {
+            ManageItem::Letter { partition, current: Some(c) } => format!("Change drive letter of partition {partition} ({c}:)"),
+            ManageItem::Letter { partition, current: None } => format!("Assign a drive letter to partition {partition}"),
+            ManageItem::Label { letter, current } => format!("Rename volume {letter}: ('{current}')"),
+            ManageItem::Op(ManageOp::RemoveLetter { partition, letter }) => format!("Remove drive letter {letter}: from partition {partition}"),
+            ManageItem::Op(ManageOp::Online) => "Bring the disk online".into(),
+            ManageItem::Op(ManageOp::Offline) => "Take the disk offline (unmount everything, keep data)".into(),
+            ManageItem::Op(ManageOp::Eject { .. }) => "Safely eject (flush and prepare for unplugging)".into(),
+            ManageItem::Op(ManageOp::ClearReadOnly) => "Clear the read-only flag".into(),
+            ManageItem::Op(op) => op.title(0),
+        }
+    }
 }
 
 pub enum PendingAction {
@@ -233,6 +264,8 @@ pub enum Modal {
     Update { steps: Vec<String>, done: Option<Result<String, String>> },
     /// `a`: edit the automatic backup schedule for the selected disk.
     Schedule { s: Schedule, field: usize, installed: bool },
+    /// `m`: quick non-destructive actions for the selected disk.
+    ManageMenu { idx: usize },
 }
 
 pub struct App {
@@ -944,6 +977,26 @@ impl App {
                             self.modal = Modal::Input { purpose, buf };
                         }
                     },
+                    InputPurpose::DriveLetter { partition, free } => {
+                        let c = buf.trim().trim_end_matches(':').chars().next().map(|c| c.to_ascii_uppercase());
+                        match c {
+                            Some(c) if c.is_ascii_alphabetic() && c >= 'D' && free.contains(&c) => {
+                                self.start_manage(ManageOp::SetLetter { partition, letter: c });
+                            }
+                            Some(c) if c.is_ascii_alphabetic() => {
+                                self.error(format!("{c}: is in use or reserved — free letters: {}", free.iter().collect::<String>()));
+                                self.modal = Modal::Input { purpose: InputPurpose::DriveLetter { partition, free }, buf };
+                            }
+                            _ => {
+                                self.error("type a single letter, e.g. E");
+                                self.modal = Modal::Input { purpose: InputPurpose::DriveLetter { partition, free }, buf };
+                            }
+                        }
+                    }
+                    InputPurpose::VolumeLabel { letter } => {
+                        let label: String = buf.trim().chars().filter(|c| !r#"\/:*?"<>|"#.contains(*c)).take(32).collect();
+                        self.start_manage(ManageOp::SetLabel { letter, label });
+                    }
                     InputPurpose::CloneTarget => match self.validate_clone_target(&buf) {
                         Ok((source, target)) => {
                             if self.guard_target(&target) {
@@ -986,6 +1039,36 @@ impl App {
                 }
                 _ => self.modal = Modal::Confirm { action, buf },
             },
+            Modal::ManageMenu { mut idx } => {
+                let items = self.manage_items();
+                let n = items.len().max(1);
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {}
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        idx = (idx + n - 1) % n;
+                        self.modal = Modal::ManageMenu { idx };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        idx = (idx + 1) % n;
+                        self.modal = Modal::ManageMenu { idx };
+                    }
+                    KeyCode::Enter => match items.get(idx).cloned() {
+                        Some(ManageItem::Op(op)) => self.start_manage(op),
+                        Some(ManageItem::Letter { partition, .. }) => {
+                            let free = ops::free_drive_letters();
+                            self.modal = Modal::Input {
+                                purpose: InputPurpose::DriveLetter { partition, free },
+                                buf: String::new(),
+                            };
+                        }
+                        Some(ManageItem::Label { letter, current }) => {
+                            self.modal = Modal::Input { purpose: InputPurpose::VolumeLabel { letter }, buf: current };
+                        }
+                        None => {}
+                    },
+                    _ => self.modal = Modal::ManageMenu { idx },
+                }
+            }
             Modal::Update { steps, done } => self.key_update(k, steps, done),
             Modal::Schedule { s, field, installed } => self.key_schedule(k, s, field, installed),
             Modal::Progress(p) => {
@@ -1042,6 +1125,15 @@ impl App {
             KeyCode::Char('?') => self.modal = Modal::Help,
             KeyCode::Char('U') => self.modal = Modal::Update { steps: Vec::new(), done: None },
             KeyCode::Char('a') => self.open_schedule(),
+            KeyCode::Char('m') => {
+                if !self.elevated {
+                    self.error("administrator rights required — restart this app from an elevated terminal");
+                } else if self.selected_disk().is_some() {
+                    self.modal = Modal::ManageMenu { idx: 0 };
+                } else {
+                    self.error("no disk selected");
+                }
+            }
             KeyCode::Char('f') => {
                 if self.guard() {
                     self.modal = Modal::Presets { idx: 0 };
@@ -1099,6 +1191,66 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    // ----- m: manage menu -------------------------------------------------------
+
+    /// Rows of the manage menu for the selected disk.
+    pub fn manage_items(&self) -> Vec<ManageItem> {
+        let Some(d) = self.selected_disk() else { return Vec::new() };
+        let mut v = Vec::new();
+        if d.offline {
+            v.push(ManageItem::Op(ManageOp::Online));
+        } else {
+            for p in d.partitions.iter().filter(|p| !p.fs.is_empty() || !p.letter.is_empty()) {
+                let current = p.letter.chars().next();
+                v.push(ManageItem::Letter { partition: p.number, current });
+                if let Some(c) = current {
+                    v.push(ManageItem::Label { letter: c, current: p.label.clone() });
+                    v.push(ManageItem::Op(ManageOp::RemoveLetter { partition: p.number, letter: c }));
+                }
+            }
+            v.push(ManageItem::Op(ManageOp::Offline));
+        }
+        if d.readonly {
+            v.push(ManageItem::Op(ManageOp::ClearReadOnly));
+        }
+        let letter = d.partitions.iter().find_map(|p| p.letter.chars().next());
+        v.push(ManageItem::Op(ManageOp::Eject { letter }));
+        v
+    }
+
+    /// Manage ops never destroy data, but they do change what Windows mounts,
+    /// so the system/boot disk and the disk running this app stay off-limits
+    /// unless the override is on.
+    fn start_manage(&mut self, op: ManageOp) {
+        let Some(disk) = self.selected_disk().cloned() else {
+            self.error("no disk selected");
+            return;
+        };
+        let reasons = self.protection_reasons(&disk);
+        if !reasons.is_empty() && !self.unlocked {
+            self.error(format!(
+                "disk {} is protected ({}) — press u to enable the safety override",
+                disk.number,
+                reasons.join(", ")
+            ));
+            return;
+        }
+        logger::log(format!("manage: {} on disk {} · {} · serial {}", op.title(disk.number), disk.number, disk.name, disk.serial));
+        let progress = ProgressState {
+            title: op.title(disk.number),
+            pct: None,
+            detail: String::new(),
+            samples: Vec::new(),
+            logs: Vec::new(),
+            started: Instant::now(),
+            done: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancellable: false,
+        };
+        ops::spawn_manage(self.tx.clone(), disk, op);
+        self.modal = Modal::Progress(progress);
     }
 
     // ----- Shift+U: update dialog -------------------------------------------

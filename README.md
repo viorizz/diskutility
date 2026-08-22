@@ -81,6 +81,9 @@ script, `diskutility --update` does the same.
   space and same-disk checks. Restore it onto any disk with `i`.
 - **Clone** (`d`) — sector-for-sector disk-to-disk copy with the partition
   table written last (no mid-copy automount), followed by verification.
+- **Manage** (`m`) — assign/change/remove drive letters, rename a volume,
+  bring a disk online/offline, safely eject, clear the read-only flag. Nothing
+  here erases data; protected disks are refused.
 - **Automatic backups** (`a`) — schedule a full image of the selected disk
   every N minutes/hours, daily, weekly, monthly or yearly. The app registers a
   Windows Task Scheduler job (`DiskUtility Backup`) that runs

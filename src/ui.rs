@@ -51,6 +51,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::Progress(p) => draw_progress(f, area, app, p),
         Modal::Update { steps, done } => draw_update(f, area, app, steps, done.as_ref()),
         Modal::Schedule { s, field, installed } => draw_schedule(f, area, s, *field, *installed),
+        Modal::ManageMenu { idx } => draw_manage_menu(f, area, app, *idx),
     }
 }
 
@@ -308,6 +309,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         txt(" clone · "),
         key("a"),
         txt(" auto · "),
+        key("m"),
+        txt(" manage · "),
         key("b"),
         txt(" test · "),
         key("h"),
@@ -537,9 +540,24 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, purpose: &InputPurpose, buf:
             "Clone — which disk should be OVERWRITTEN with a copy of the selected disk?".to_string(),
             "type the TARGET disk number from the list   ·   Enter continue · Esc cancel",
         ),
+        InputPurpose::DriveLetter { partition, .. } => (
+            format!("Drive letter for partition {partition}"),
+            "type one letter   ·   Enter apply · Esc cancel",
+        ),
+        InputPurpose::VolumeLabel { letter } => (
+            format!("New label for volume {letter}:"),
+            "up to 32 characters (11 on FAT32)   ·   Enter apply · Esc cancel",
+        ),
     };
     let extra = match purpose {
         InputPurpose::BackupPath => backup_size_line(app, buf),
+        InputPurpose::DriveLetter { free, .. } => Some(Line::from(vec![
+            Span::styled("Available  ", Style::new().fg(DIM)),
+            Span::styled(
+                free.iter().map(|c| format!("{c}:")).collect::<Vec<_>>().join(" "),
+                Style::new().fg(OK_C),
+            ),
+        ])),
         _ => None,
     };
     let h = if extra.is_some() { 9 } else { 7 };
@@ -887,7 +905,7 @@ fn draw_health(
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 27, "Help", ACCENT);
+    let inner = modal_block(f, area, 74, 28, "Help", ACCENT);
     let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
@@ -906,6 +924,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("n", "set a network drive / folder as the default backup destination"),
         key("d", "clone the disk sector-for-sector onto another disk (verified)"),
         key("a", "automatic backups — schedule a Task Scheduler job for the disk"),
+        key("m", "manage: drive letters, volume label, online/offline, eject, read-only"),
         key("Shift+U", "install an available update / toggle auto-update on launch"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),
@@ -1082,6 +1101,53 @@ fn draw_schedule(f: &mut Frame, area: Rect, s: &Schedule, field: usize, installe
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "↑↓ row · ←→ change · Enter save & register task · n destination · x remove schedule · Esc cancel",
+        Style::new().fg(DIM),
+    )));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_manage_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
+    let items = app.manage_items();
+    let disk = app.selected_disk();
+    let h = 9 + items.len() as u16;
+    let title = match disk {
+        Some(d) => format!("Manage — disk {} · {}", d.number, d.name),
+        None => "Manage".into(),
+    };
+    let inner = modal_block(f, area, 72, h, &title, ACCENT);
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(d) = disk {
+        lines.push(Line::from(vec![
+            Span::styled("State  ", Style::new().fg(DIM)),
+            Span::styled(
+                if d.offline { "offline" } else { "online" },
+                Style::new().fg(if d.offline { WARN_C } else { OK_C }),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  {}  ·  {} partition(s){}",
+                    d.style,
+                    d.partitions.len(),
+                    if d.readonly { "  ·  READ-ONLY" } else { "" }
+                ),
+                Style::new().fg(DIM),
+            ),
+        ]));
+        lines.push(Line::default());
+    }
+    for (i, it) in items.iter().enumerate() {
+        let selected = i == idx;
+        let marker = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::new().fg(ACCENT_SOFT).bg(SEL_BG).bold()
+        } else {
+            Style::new().fg(TEXT)
+        };
+        lines.push(Line::from(Span::styled(format!("{marker}{}", it.label()), style)));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "These change how Windows mounts the disk; no data is erased.   Enter choose · Esc cancel",
         Style::new().fg(DIM),
     )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

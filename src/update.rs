@@ -76,6 +76,7 @@ pub fn self_update_with(progress: &dyn Fn(&str)) -> Result<String, String> {
         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
          Invoke-WebRequest -Uri '{url}' -OutFile '{staged}' -UseBasicParsing
          $sums = (Invoke-WebRequest -Uri '{sums}' -UseBasicParsing).Content
+         if ($sums -is [byte[]]) {{ $sums = [Text.Encoding]::UTF8.GetString($sums) }}
          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath '{staged}').Hash.ToLower()
          Write-Output \"HASH:$hash\"
          Write-Output 'SUMS:'
