@@ -8,11 +8,6 @@ comparison link is appended below these notes.
 
 ## v0.4.7 — 2026-08-22
 
-### Fixed
-- **`--update` / `Shift+U` failed with "checksums.txt has no entry for diskutility.exe"** even though the release's `checksums.txt` was correct. GitHub serves release assets as `application/octet-stream`, so PowerShell's `Invoke-WebRequest ... .Content` returned the file as a `byte[]`; written to the pipe, that became one integer per line and the SHA-256 parser found no `diskutility.exe` entry. The updater now decodes the bytes as UTF-8 before parsing. `install.ps1` had the same latent bug and is fixed the same way — use it (or `winget upgrade`) to get past v0.4.6, since the old binary cannot self-update.
-
-## v0.4.7 — 2026-08-22
-
 ### Added
 - **Manage menu (`m`)** — quick, non-destructive actions for the selected disk, each run with the same disk-identity check as every other operation and reported in the progress dialog:
   - **Assign or change a drive letter** for any partition with a filesystem. The prompt lists the letters that are actually free (it also excludes mapped network drives, which `Get-Volume` would miss) and refuses A–C and letters in use.
@@ -25,6 +20,9 @@ comparison link is appended below these notes.
 
 ### Changed
 - Footer shows `m  manage`; Help gained a line for it.
+
+### Fixed
+- **`--update` / `Shift+U` failed with "checksums.txt has no entry for diskutility.exe"** even though the release's `checksums.txt` was correct. GitHub serves release assets as `application/octet-stream`, so PowerShell's `Invoke-WebRequest ... .Content` returned the file as a `byte[]`; written to the pipe, that became one integer per line and the SHA-256 parser found no `diskutility.exe` entry. The updater now decodes the bytes as UTF-8 before parsing. `install.ps1` had the same latent bug and is fixed the same way — use it (or `winget upgrade`) to get past v0.4.6, since the old binary cannot self-update.
 
 ## v0.4.6 — 2026-08-22
 
