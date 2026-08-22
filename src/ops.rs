@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -728,17 +729,71 @@ pub fn free_space(path: &std::path::Path) -> Option<u64> {
     (ok != 0).then_some(free)
 }
 
+/// Filesystem name ("NTFS", "FAT32", "exFAT"…) of the volume at a drive letter.
+pub fn volume_filesystem(drive: char) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+    let root: Vec<u16> = format!("{drive}:\\").encode_utf16().chain(std::iter::once(0)).collect();
+    let mut fs = [0u16; 64];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs.as_mut_ptr(),
+            fs.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+    Some(String::from_utf16_lossy(&fs[..len]))
+}
+
+/// Read-only identity check (no Set-Disk): the live disk at this number must
+/// still be the device the user selected. Used for read sources, where the
+/// mutating prep script is not appropriate.
+pub fn verify_identity(disk: &Disk) -> Result<(), String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'\n\
+         $d = Get-Disk -Number {n}\n\
+         $liveSerial = ([string]$d.SerialNumber).Trim()\n\
+         $liveName = ([string]$d.FriendlyName).Trim()\n\
+         if ([uint64]$d.Size -ne [uint64]{size} -or $liveName -ne '{name}' -or ('{serial}' -ne '' -and $liveSerial -ne '{serial}')) {{ throw \"disk {n} is no longer the device you selected (found '$liveName' serial '$liveSerial' $($d.Size) bytes) - disk numbers change when drives are plugged or unplugged; rescan (r) and retry\" }}\n\
+         Write-Output 'identity: verified'",
+        n = disk.number,
+        size = disk.size,
+        name = ps_quote(&disk.name),
+        serial = ps_quote(&disk.serial),
+    );
+    run_ps(&script).map(|_| ())
+}
+
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+
 /// Read the whole disk through an uncached handle into an image file.
 /// Non-destructive for the disk; a cancelled run deletes the partial file.
 pub fn spawn_backup(tx: Sender<AppEvent>, disk: Disk, path: PathBuf, cancel: Arc<AtomicBool>) {
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
             log(&tx, format!("Backing up disk {} ({}) → {}", disk.number, human(disk.size), path.display()));
-            if !disk.partitions.is_empty() {
+            log(&tx, "Verifying source identity…");
+            verify_identity(&disk)?;
+            if disk.partitions.iter().any(|p| !p.letter.is_empty()) {
                 log(&tx, "Note: volumes are mounted — this is a live snapshot; close programs writing to the disk for a consistent image.");
             }
             let mut src = crate::bench::open_direct(disk.number, false)?;
-            let mut out = File::create(&path).map_err(|e| format!("cannot create image file: {e}"))?;
+            // create_new: never overwrite; SEQUENTIAL_SCAN keeps a multi-TB
+            // stream from bloating the cache manager
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+                .open(&path)
+                .map_err(|e| format!("cannot create image file: {e}"))?;
             let mut buf = crate::bench::AlignedBuf::new(CHUNK);
             let total = disk.size;
             let start = Instant::now();
@@ -798,9 +853,11 @@ pub fn spawn_clone(
                     human(target.size)
                 ));
             }
-            if !source.partitions.is_empty() {
+            if source.partitions.iter().any(|p| !p.letter.is_empty()) {
                 log(&tx, "Note: source volumes are mounted — this is a live snapshot; close programs writing to it for a consistent clone.");
             }
+            log(&tx, "Verifying source identity…");
+            verify_identity(&source)?;
             log(&tx, "Preparing target (identity check, write-protection, wipe)…");
             run_prep(&tx, &target, allow_protected)?;
             let mut src = crate::bench::open_direct(source.number, false)?;
@@ -830,6 +887,19 @@ pub fn spawn_clone(
                     progress_with(&tx, done_b, total, start, "clone");
                     last = Instant::now();
                 }
+            }
+            // A larger target keeps its OLD backup GPT header/entries at its
+            // last LBAs (Clear-Disk only wipes the primary). The cloned primary
+            // points its backup at source.size-1, so tools would see a stale
+            // table at end-of-disk and offer to "restore" it — zero it.
+            if target.size > source.size {
+                const TAIL: u64 = 1024 * 1024;
+                let tail_start = target.size.saturating_sub(TAIL) / 512 * 512;
+                let tail_len = (target.size - tail_start) as usize;
+                log(&tx, format!("Target is larger than source — clearing its old end-of-disk GPT area ({})", human(tail_len as u64)));
+                dst.seek(SeekFrom::Start(tail_start)).map_err(|e| format!("seek failed: {e}"))?;
+                dst.write_all(&vec![0u8; tail_len])
+                    .map_err(|e| format!("target tail clear failed: {e}"))?;
             }
             log(&tx, "Writing the partition table (first sectors)…");
             dst.seek(SeekFrom::Start(0)).map_err(|e| format!("seek failed: {e}"))?;

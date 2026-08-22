@@ -446,6 +446,15 @@ impl App {
                     disk.number
                 ));
             }
+            // FAT32 caps files at 4 GiB; the write would die at exactly that point
+            if let Some(fs) = ops::volume_filesystem(drive) {
+                if fs.eq_ignore_ascii_case("FAT32") && disk.size >= 4 * 1024 * 1024 * 1024 {
+                    return Err(format!(
+                        "{drive}: is FAT32, which cannot hold files over 4 GiB — a {} image won't fit. Use an NTFS or exFAT destination.",
+                        disks::human(disk.size)
+                    ));
+                }
+            }
         }
         if let Some(free) = ops::free_space(&path) {
             if free < disk.size {
