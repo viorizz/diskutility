@@ -4,7 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, InputPurpose, Modal, PendingAction, ProgressState};
+use crate::app::{schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
+use crate::config::Schedule;
 use crate::disks::{fit, human, Disk};
 use crate::ops::PRESETS;
 
@@ -48,6 +49,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::Input { purpose, buf } => draw_input(f, area, app, purpose, buf),
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
         Modal::Progress(p) => draw_progress(f, area, app, p),
+        Modal::Update { steps, done } => draw_update(f, area, app, steps, done.as_ref()),
+        Modal::Schedule { s, field, installed } => draw_schedule(f, area, s, *field, *installed),
     }
 }
 
@@ -84,7 +87,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut spans: Vec<Span> = Vec::new();
     if let Some(tag) = &app.update {
         spans.push(Span::styled(
-            format!("⬆ {tag} available — diskutility --update"),
+            format!("⬆ {tag} available — Shift+U to update"),
             Style::new().fg(ACCENT_SOFT),
         ));
         spans.push(Span::styled(" · ", Style::new().fg(DIM)));
@@ -303,6 +306,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         txt(" backup dir · "),
         key("d"),
         txt(" clone · "),
+        key("a"),
+        txt(" auto · "),
         key("b"),
         txt(" test · "),
         key("h"),
@@ -882,7 +887,7 @@ fn draw_health(
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 25, "Help", ACCENT);
+    let inner = modal_block(f, area, 74, 27, "Help", ACCENT);
     let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
@@ -900,6 +905,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("s", "backup the whole disk to an .img file (restore with i)"),
         key("n", "set a network drive / folder as the default backup destination"),
         key("d", "clone the disk sector-for-sector onto another disk (verified)"),
+        key("a", "automatic backups — schedule a Task Scheduler job for the disk"),
+        key("Shift+U", "install an available update / toggle auto-update on launch"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),
         key("u", "toggle safety override — allow protected disks (DANGEROUS)"),
@@ -924,5 +931,158 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::default(),
         note("press any key to close"),
     ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_update(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    steps: &[String],
+    done: Option<&Result<String, String>>,
+) {
+    let color = match done {
+        Some(Ok(_)) => OK_C,
+        Some(Err(_)) => ERR_C,
+        None => ACCENT,
+    };
+    let h = 13 + steps.len().min(8) as u16;
+    let inner = modal_block(f, area, 76, h, "Update", color);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Installed  ", Style::new().fg(DIM)),
+        Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), Style::new().fg(TEXT).bold()),
+        Span::styled("   Latest  ", Style::new().fg(DIM)),
+        match &app.update {
+            Some(tag) => Span::styled(tag.clone(), Style::new().fg(ACCENT_SOFT).bold()),
+            None => Span::styled("no newer release found", Style::new().fg(TEXT)),
+        },
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Auto-update on launch  ", Style::new().fg(DIM)),
+        if app.config.auto_update {
+            Span::styled("ON", Style::new().fg(OK_C).bold())
+        } else {
+            Span::styled("off", Style::new().fg(TEXT))
+        },
+    ]));
+    lines.push(Line::default());
+    if steps.is_empty() && done.is_none() {
+        if app.update.is_some() {
+            lines.push(Line::from(Span::styled(
+                "Download the new release, verify its SHA-256 against the published checksums, and restart into it?",
+                Style::new().fg(TEXT),
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "y  update now   ·   n  not now   ·   a  toggle auto-update on launch",
+                Style::new().fg(DIM),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "You are running the latest version (or the startup check is still running / disabled).",
+                Style::new().fg(TEXT),
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "a  toggle auto-update on launch   ·   Esc  close",
+                Style::new().fg(DIM),
+            )));
+        }
+    } else {
+        for st in steps.iter().rev().take(8).rev() {
+            lines.push(Line::from(vec![
+                Span::styled("  · ", Style::new().fg(DIM)),
+                Span::styled(st.clone(), Style::new().fg(TEXT)),
+            ]));
+        }
+        lines.push(Line::default());
+        match done {
+            None => lines.push(Line::from(Span::styled(
+                format!("{} working — please wait", SPINNER[app.tick % SPINNER.len()]),
+                Style::new().fg(ACCENT_SOFT),
+            ))),
+            Some(Ok(m)) => {
+                lines.push(Line::from(Span::styled(m.clone(), Style::new().fg(OK_C))));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    if crate::update::updated(m) {
+                        "Enter  restart into the new version now"
+                    } else {
+                        "Enter  close"
+                    },
+                    Style::new().fg(DIM),
+                )));
+            }
+            Some(Err(e)) => {
+                lines.push(Line::from(Span::styled(format!("✗ {e}"), Style::new().fg(ERR_C))));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled("Enter  close", Style::new().fg(DIM))));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_schedule(f: &mut Frame, area: Rect, s: &Schedule, field: usize, installed: bool) {
+    let fields = schedule_fields(s);
+    let h = 14 + fields.len() as u16;
+    let inner = modal_block(f, area, 78, h, "Automatic backup — Windows Task Scheduler", ACCENT);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Disk         ", Style::new().fg(DIM)),
+        Span::styled(format!("{} · {}", s.disk_name, human(s.disk_size)), Style::new().fg(TEXT).bold()),
+        Span::styled(
+            if s.disk_serial.is_empty() { String::new() } else { format!("   serial {}", s.disk_serial) },
+            Style::new().fg(DIM),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Destination  ", Style::new().fg(DIM)),
+        Span::styled(s.dest_dir.clone(), Style::new().fg(TEXT)),
+        Span::styled("   (change with n)", Style::new().fg(DIM)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Task         ", Style::new().fg(DIM)),
+        if installed {
+            Span::styled("registered", Style::new().fg(OK_C))
+        } else {
+            Span::styled("not registered yet", Style::new().fg(WARN_C))
+        },
+        Span::styled(
+            "   runs elevated while you are logged on, even if this app is closed",
+            Style::new().fg(DIM),
+        ),
+    ]));
+    lines.push(Line::default());
+    for (i, fld) in fields.iter().enumerate() {
+        let selected = i == field;
+        let marker = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::new().fg(ACCENT_SOFT).bg(SEL_BG).bold()
+        } else {
+            Style::new().fg(TEXT)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{:<14}", fld.label()), style),
+            Span::styled(if selected { "◂ " } else { "  " }, Style::new().fg(ACCENT_SOFT)),
+            Span::styled(format!("{:<22}", schedule_value(s, *fld)), style),
+            Span::styled(if selected { " ▸" } else { "  " }, Style::new().fg(ACCENT_SOFT)),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("Runs ", Style::new().fg(DIM)),
+        Span::styled(s.describe(), Style::new().fg(TEXT).bold()),
+        Span::styled(
+            "  — images are named auto-<disk>-<serial>-<date>.img; older ones are deleted past the keep count.",
+            Style::new().fg(DIM),
+        ),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "↑↓ row · ←→ change · Enter save & register task · n destination · x remove schedule · Esc cancel",
+        Style::new().fg(DIM),
+    )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }

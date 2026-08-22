@@ -20,17 +20,22 @@ irm https://raw.githubusercontent.com/viorizz/diskutility/main/install.ps1 | iex
 [latest release](https://github.com/viorizz/diskutility/releases/latest)
 (verify with `checksums.txt`).
 
+**winget:** (once the package is accepted into the community repository)
+
+```powershell
+winget install viorizz.diskutility
+```
+
 **From source:**
 
 ```powershell
 cargo install --git https://github.com/viorizz/diskutility
 ```
 
-**Stay up to date:** the TUI shows a banner when a new release is out — apply it with:
-
-```powershell
-diskutility --update
-```
+**Stay up to date:** the TUI shows a banner when a new release is out — press
+`Shift+U` to download it (SHA-256 verified) and restart into the new version
+right there, or toggle **auto-update on launch** in the same dialog. From a
+script, `diskutility --update` does the same.
 
 ```
 ╭──────────────────────────────────────────────────────────────────╮
@@ -76,6 +81,15 @@ diskutility --update
   space and same-disk checks. Restore it onto any disk with `i`.
 - **Clone** (`d`) — sector-for-sector disk-to-disk copy with the partition
   table written last (no mid-copy automount), followed by verification.
+- **Automatic backups** (`a`) — schedule a full image of the selected disk
+  every N minutes/hours, daily, weekly, monthly or yearly. The app registers a
+  Windows Task Scheduler job (`DiskUtility Backup`) that runs
+  `diskutility --scheduled-backup` elevated while you are logged on — nothing
+  needs to stay open or autostart. The disk is matched by serial and size (disk
+  numbers shift), images go to your saved backup destination (`n`) as
+  `auto-<disk>-<serial>-<timestamp>.img`, and older images beyond the *keep*
+  count are pruned. If the disk is not connected at run time, nothing happens
+  and the log says so.
 
 ## Safety
 
@@ -98,11 +112,14 @@ diskutility --update
 - PowerShell is always launched by absolute path (`%SystemRoot%\System32\...`)
   with `-NoProfile` and a module path pinned to system directories, and every
   script receives only integers and quoted/sanitized strings.
-- `diskutility --update` downloads only from this repository's GitHub
-  releases, verifies the SHA-256 against the release's `checksums.txt`, and
-  checks the new binary runs before swapping it in. The start-up update check
-  is the TUI's only network access; disable it with `--no-update-check` or
-  `DISKUTILITY_NO_UPDATE_CHECK=1`.
+- Updates (`Shift+U`, `--update`, or auto-update on launch) download only
+  from this repository's GitHub releases, verify the SHA-256 against the
+  release's `checksums.txt`, and check the new binary runs before swapping it
+  in. The start-up update check is the TUI's only network access; disable it
+  (and auto-update) with `--no-update-check` or `DISKUTILITY_NO_UPDATE_CHECK=1`.
+- Scheduled backups are plain Task Scheduler jobs you can inspect or delete in
+  **Task Scheduler** (`taskschd.msc`); the command line they run is visible
+  there. They only read the source disk.
 
 ## Build & run
 
@@ -114,6 +131,18 @@ cargo build --release          # → target/release/diskutility.exe
 .\target\release\diskutility.exe          # TUI (run elevated for write ops)
 .\target\release\diskutility.exe --list   # read-only disk listing, no TUI
 ```
+
+### Releasing
+
+Every release carries detailed patch notes, kept in [CHANGELOG.md](CHANGELOG.md).
+To cut a release: bump `version` in `Cargo.toml`, add a `## vX.Y.Z — date`
+section to `CHANGELOG.md` describing every change, commit, then push the
+`vX.Y.Z` tag. The release workflow builds the exe, extracts that section as the
+GitHub release body (GitHub's auto-generated comparison link is appended), and
+fails if the section is missing. `packaging/sync-release-notes.ps1` pushes the
+changelog onto already-published releases (needs `gh auth login`). A `winget`
+job then submits the version to microsoft/winget-pkgs when the `WINGET_TOKEN`
+secret is configured — see [packaging/winget](packaging/winget/README.md).
 
 ## Troubleshooting
 

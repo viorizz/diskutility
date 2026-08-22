@@ -23,10 +23,43 @@ jobs:
           $hash = (Get-FileHash diskutility.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  diskutility.exe" | Out-File -Encoding ascii checksums.txt
           Get-Content checksums.txt
+      - name: Extract patch notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $notes = ./packaging/changelog-section.ps1 -Version $version
+          if (-not $notes) {
+            Write-Error "CHANGELOG.md has no '## v$version' section — add patch notes before tagging."
+            exit 1
+          }
+          $notes | Out-File -Encoding utf8 RELEASE_NOTES.md
+          Get-Content RELEASE_NOTES.md
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
           files: |
             diskutility.exe
             checksums.txt
-          generate_release_notes: true
+
+  # Publishes the new version to winget (microsoft/winget-pkgs) once the
+  # package exists there. Needs a repo secret WINGET_TOKEN: a GitHub PAT with
+  # `public_repo` scope, used by wingetcreate to fork winget-pkgs and open the
+  # PR. The job is skipped silently when the secret is not configured.
+  winget:
+    needs: release
+    runs-on: windows-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submit to winget
+        shell: pwsh
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Host "WINGET_TOKEN secret not set - skipping winget submission."
+            exit 0
+          }
+          ./packaging/winget/submit.ps1 -Version $env:GITHUB_REF_NAME -Token $env:WINGET_TOKEN

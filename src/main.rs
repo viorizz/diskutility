@@ -7,6 +7,7 @@ mod config;
 mod disks;
 mod logger;
 mod ops;
+mod schedule;
 mod ui;
 mod update;
 
@@ -33,13 +34,25 @@ fn main() -> anyhow::Result<()> {
     update::cleanup();
 
     if std::env::args().any(|a| a == "--update") {
-        match update::self_update() {
+        match update::self_update_with(&|step| println!("{step}")) {
             Ok(msg) => {
                 println!("{msg}");
                 return Ok(());
             }
             Err(e) => anyhow::bail!("update failed: {e}"),
         }
+    }
+
+    // `diskutility --scheduled-backup` — headless run launched by the
+    // Task Scheduler job registered with the `a` key.
+    if std::env::args().any(|a| a == schedule::CLI_FLAG) {
+        return match schedule::run_headless() {
+            Ok(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            Err(e) => anyhow::bail!("scheduled backup failed: {e}"),
+        };
     }
 
     // `diskutility --health <disk number>` — print SMART/health data and exit
@@ -71,10 +84,30 @@ fn main() -> anyhow::Result<()> {
         return list_disks();
     }
 
+    // Opt-in automatic update on launch (Shift+U → a in the TUI). Network
+    // access still honours --no-update-check / DISKUTILITY_NO_UPDATE_CHECK.
+    if config::load().auto_update && !app::update_check_opted_out() {
+        println!("diskutility: auto-update is on — checking for a new release…");
+        match update::self_update_with(&|step| println!("  {step}")) {
+            Ok(msg) if update::updated(&msg) => {
+                println!("  {msg}");
+                println!("  restarting…");
+                std::process::exit(update::relaunch().map_err(|e| anyhow::anyhow!(e))?);
+            }
+            Ok(msg) => println!("  {msg}"),
+            Err(e) => println!("  update skipped: {e}"),
+        }
+    }
+
     let mut terminal = ratatui::init();
     let _ = crossterm_set_title();
-    let result = app::App::new().run(&mut terminal);
+    let mut app = app::App::new();
+    let result = app.run(&mut terminal);
     ratatui::restore();
+    if app.restart_requested() {
+        println!("diskutility: restarting into the new version…");
+        std::process::exit(update::relaunch().map_err(|e| anyhow::anyhow!(e))?);
+    }
     result
 }
 

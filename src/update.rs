@@ -46,12 +46,21 @@ fn allowed_url(url: &str) -> bool {
 /// `checksums.txt`, sanity-check it, then swap it in over the running
 /// executable (Windows allows renaming a running exe, just not deleting it —
 /// the old version is parked as *.old and removed on next start).
-pub fn self_update() -> Result<String, String> {
+/// Outcome of `self_update_with`: whether a new binary was actually installed.
+pub fn updated(msg: &str) -> bool {
+    msg.starts_with("Updated ")
+}
+
+/// Same as `self_update`, reporting each step through `progress` (used by
+/// the Shift+U dialog in the TUI and the launch-time auto-update).
+pub fn self_update_with(progress: &dyn Fn(&str)) -> Result<String, String> {
     let current = env!("CARGO_PKG_VERSION");
     logger::log("update: checking latest release");
+    progress("Checking the latest release on GitHub…");
     let Some((tag, url)) = check_latest()? else {
         return Ok(format!("diskutility v{current} is already the latest version."));
     };
+    progress(&format!("{tag} is available — downloading…"));
     if !allowed_url(&url) {
         return Err(format!("refusing to download from unexpected location: {url}"));
     }
@@ -82,10 +91,12 @@ pub fn self_update() -> Result<String, String> {
             return Err(e);
         }
     };
+    progress("Verifying SHA-256 against checksums.txt…");
     if let Err(e) = verify_download(&out, &staged) {
         let _ = std::fs::remove_file(&staged);
         return Err(e);
     }
+    progress("Swapping the new executable in…");
     let _ = std::fs::remove_file(&backup);
     std::fs::rename(&exe, &backup).map_err(|e| format!("cannot move current exe aside: {e}"))?;
     if let Err(e) = std::fs::rename(&staged, &exe) {
@@ -148,6 +159,20 @@ fn verify_download(ps_out: &str, staged: &std::path::Path) -> Result<(), String>
     }
     logger::log(format!("update: new binary reports '{}'", banner.trim()));
     Ok(())
+}
+
+/// Run the (freshly installed) executable in this console with the same
+/// arguments and wait for it — used to restart into a new version. Returns
+/// the child's exit code.
+pub fn relaunch() -> Result<i32, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own exe: {e}"))?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!("update: relaunching {} {}", exe.display(), args.join(" ")));
+    let status = std::process::Command::new(&exe)
+        .args(&args)
+        .status()
+        .map_err(|e| format!("could not start the new version: {e}"))?;
+    Ok(status.code().unwrap_or(0))
 }
 
 /// Remove the parked previous version left behind by a self-update.

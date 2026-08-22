@@ -1,31 +1,34 @@
 # Publishing to winget
 
-diskutility ships as a **portable** winget package (a bare exe, no installer).
-Submission targets [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs).
+diskutility ships as a **portable** winget package (a bare exe, command alias
+`diskutility`). Package identifier: `viorizz.diskutility`. Submissions go to
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs).
 
-## Easiest path: wingetcreate
+## Scripts
 
-After a GitHub release exists, run:
+| script | purpose |
+|---|---|
+| `make-manifests.ps1 -Version X.Y.Z` | writes `manifests/*.yaml` for a published release, pulling the SHA256 from that release's `checksums.txt` |
+| `submit.ps1 -Version X.Y.Z -Token <PAT> [-First] [-DryRun]` | submits via `wingetcreate` (installs it if missing) |
+
+`winget validate --manifest packaging/winget/manifests` checks the generated
+files locally.
+
+## First submission (one-time, manual)
 
 ```powershell
-winget install wingetcreate
-wingetcreate new https://github.com/viorizz/diskutility/releases/download/v0.3.0/diskutility.exe
+./packaging/winget/submit.ps1 -Version 0.4.6 -Token $env:WINGET_TOKEN -First
 ```
 
-Answer the prompts with:
-- PackageIdentifier: `viorizz.diskutility`
-- InstallerType: `portable`
-- Command alias: `diskutility`
-- License: `MIT`
+The token is a GitHub personal access token with the `public_repo` scope;
+`wingetcreate` uses it to fork winget-pkgs and open the PR under your account.
+New packages get a short manual review by Microsoft; after the PR merges,
+`winget install viorizz.diskutility` works.
 
-`wingetcreate` computes the SHA256, generates the three manifest files, and can
-submit the PR to microsoft/winget-pkgs for you (needs a GitHub token; first-time
-publishers go through a short manual review by Microsoft).
+## Every later release (automatic)
 
-## Template
-
-`manifests/` in this folder contains a filled-in template for v0.3.0 — only the
-`InstallerSha256` placeholder needs the value from the release's `checksums.txt`.
-
-For each new version: bump `PackageVersion`, update the URL + SHA256, resubmit
-(`wingetcreate update viorizz.diskutility -u <new-url> -v <version> --submit`).
+`.github/workflows/release.yml` has a `winget` job that runs
+`submit.ps1 -Version <tag>` after the GitHub release is published, **if** the
+repository secret `WINGET_TOKEN` is set (Settings → Secrets → Actions). Without
+the secret the job prints a notice and exits successfully, so releases never
+fail because of winget.

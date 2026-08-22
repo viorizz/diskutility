@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Frequency, Schedule, MONTHS, WEEKDAYS};
+use crate::schedule;
 use crate::disks::{self, Disk};
 use crate::logger;
 use crate::ops::{self, OpEvent, Preset, PRESETS};
@@ -15,7 +16,114 @@ pub enum AppEvent {
     Disks(Result<Vec<Disk>, String>),
     Op(OpEvent),
     Update(String),
+    /// Progress line from an in-app update (Shift+U → y).
+    UpdateStep(String),
+    UpdateDone(Result<String, String>),
     Health(Result<ops::HealthReport, String>),
+}
+
+/// One editable row of the schedule editor (`a` key). Which rows are shown
+/// depends on the frequency.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SchedField {
+    Frequency,
+    Every,
+    Hour,
+    Minute,
+    Weekday,
+    Day,
+    Month,
+    Keep,
+}
+
+impl SchedField {
+    pub fn label(self) -> &'static str {
+        match self {
+            SchedField::Frequency => "Frequency",
+            SchedField::Every => "Every",
+            SchedField::Hour => "Hour",
+            SchedField::Minute => "Minute",
+            SchedField::Weekday => "Weekday",
+            SchedField::Day => "Day of month",
+            SchedField::Month => "Month",
+            SchedField::Keep => "Keep images",
+        }
+    }
+}
+
+/// Rows shown for a schedule, in display order.
+pub fn schedule_fields(s: &Schedule) -> Vec<SchedField> {
+    use SchedField::*;
+    let mut v = vec![Frequency];
+    match s.frequency {
+        crate::config::Frequency::Minutes => v.push(Every),
+        crate::config::Frequency::Hourly => v.extend([Every, Hour, Minute]),
+        crate::config::Frequency::Daily => v.extend([Hour, Minute]),
+        crate::config::Frequency::Weekly => v.extend([Weekday, Hour, Minute]),
+        crate::config::Frequency::Monthly => v.extend([Day, Hour, Minute]),
+        crate::config::Frequency::Yearly => v.extend([Month, Day, Hour, Minute]),
+    }
+    v.push(Keep);
+    v
+}
+
+/// Display value of one schedule row.
+pub fn schedule_value(s: &Schedule, f: SchedField) -> String {
+    match f {
+        SchedField::Frequency => s.frequency.label().to_string(),
+        SchedField::Every => match s.frequency {
+            crate::config::Frequency::Minutes => format!("{} minute(s)", s.every),
+            _ => format!("{} hour(s)", s.every),
+        },
+        SchedField::Hour => format!("{:02} h", s.hour),
+        SchedField::Minute => format!("{:02} min", s.minute),
+        SchedField::Weekday => WEEKDAYS[s.weekday as usize % 7].to_string(),
+        SchedField::Day => s.day.to_string(),
+        SchedField::Month => MONTHS[(s.month.clamp(1, 12) - 1) as usize].to_string(),
+        SchedField::Keep => if s.keep == 0 { "all (never delete)".into() } else { format!("last {}", s.keep) },
+    }
+}
+
+/// Cycle one row by `delta` (Left = -1, Right = +1), wrapping.
+fn schedule_adjust(s: &mut Schedule, f: SchedField, delta: i32) {
+    fn wrap(v: u32, lo: u32, hi: u32, delta: i32) -> u32 {
+        let span = (hi - lo + 1) as i32;
+        let cur = v.clamp(lo, hi) as i32 - lo as i32;
+        (((cur + delta) % span + span) % span) as u32 + lo
+    }
+    match f {
+        SchedField::Frequency => {
+            let i = Frequency::ALL.iter().position(|x| *x == s.frequency).unwrap_or(2);
+            s.frequency = Frequency::ALL[wrap(i as u32, 0, 5, delta) as usize];
+            // keep `every` sensible when switching between minutes and hours
+            s.every = match s.frequency {
+                Frequency::Minutes => s.every.clamp(1, 1439),
+                _ => s.every.clamp(1, 23),
+            };
+        }
+        SchedField::Every => {
+            s.every = match s.frequency {
+                Frequency::Minutes => {
+                    const STEPS: [u32; 9] = [1, 5, 10, 15, 20, 30, 45, 60, 120];
+                    let i = STEPS.iter().position(|x| *x >= s.every).unwrap_or(STEPS.len() - 1);
+                    STEPS[wrap(i as u32, 0, STEPS.len() as u32 - 1, delta) as usize]
+                }
+                _ => wrap(s.every, 1, 23, delta),
+            };
+        }
+        SchedField::Hour => s.hour = wrap(s.hour, 0, 23, delta),
+        SchedField::Minute => s.minute = wrap(s.minute / 5 * 5, 0, 59, delta * 5),
+        SchedField::Weekday => s.weekday = wrap(s.weekday, 0, 6, delta),
+        SchedField::Day => s.day = wrap(s.day, 1, 28, delta),
+        SchedField::Month => s.month = wrap(s.month, 1, 12, delta),
+        SchedField::Keep => s.keep = wrap(s.keep, 0, 30, delta),
+    }
+}
+
+/// True when the startup update check was disabled by flag or env var.
+pub fn update_check_opted_out() -> bool {
+    std::env::args().any(|a| a == "--no-update-check")
+        || std::env::var_os("DISKUTILITY_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 pub enum InputPurpose {
@@ -120,6 +228,11 @@ pub enum Modal {
     Input { purpose: InputPurpose, buf: String },
     Confirm { action: PendingAction, buf: String },
     Progress(ProgressState),
+    /// Shift+U: offer to install an available update / toggle auto-update.
+    /// `steps` fills while the download runs; `done` ends it.
+    Update { steps: Vec<String>, done: Option<Result<String, String>> },
+    /// `a`: edit the automatic backup schedule for the selected disk.
+    Schedule { s: Schedule, field: usize, installed: bool },
 }
 
 pub struct App {
@@ -139,6 +252,8 @@ pub struct App {
     tx: mpsc::Sender<AppEvent>,
     rx: mpsc::Receiver<AppEvent>,
     quit: bool,
+    /// Set after a successful in-app update: main relaunches the new exe.
+    restart: bool,
 }
 
 impl App {
@@ -163,16 +278,19 @@ impl App {
             tx,
             rx,
             quit: false,
+            restart: false,
         }
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         self.refresh();
         // Startup update check is the only network access in the TUI; it can
         // be switched off with --no-update-check or DISKUTILITY_NO_UPDATE_CHECK=1.
-        let opted_out = std::env::args().any(|a| a == "--no-update-check")
-            || std::env::var_os("DISKUTILITY_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0");
-        if opted_out {
+        if update_check_opted_out() {
             logger::log("update check skipped (opted out)");
         } else {
             let tx = self.tx.clone();
@@ -249,6 +367,21 @@ impl App {
             AppEvent::Update(tag) => {
                 logger::log(format!("update available: {tag}"));
                 self.update = Some(tag);
+            }
+            AppEvent::UpdateStep(line) => {
+                if let Modal::Update { steps, .. } = &mut self.modal {
+                    steps.push(line);
+                }
+            }
+            AppEvent::UpdateDone(r) => {
+                if let Ok(m) = &r {
+                    if crate::update::updated(m) {
+                        self.restart = true;
+                    }
+                }
+                if let Modal::Update { done, .. } = &mut self.modal {
+                    *done = Some(r);
+                }
             }
             AppEvent::Health(r) => {
                 match &r {
@@ -853,6 +986,8 @@ impl App {
                 }
                 _ => self.modal = Modal::Confirm { action, buf },
             },
+            Modal::Update { steps, done } => self.key_update(k, steps, done),
+            Modal::Schedule { s, field, installed } => self.key_schedule(k, s, field, installed),
             Modal::Progress(p) => {
                 if k.code == KeyCode::Char('c') {
                     self.copy_log();
@@ -905,6 +1040,8 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
+            KeyCode::Char('U') => self.modal = Modal::Update { steps: Vec::new(), done: None },
+            KeyCode::Char('a') => self.open_schedule(),
             KeyCode::Char('f') => {
                 if self.guard() {
                     self.modal = Modal::Presets { idx: 0 };
@@ -961,6 +1098,141 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    // ----- Shift+U: update dialog -------------------------------------------
+
+    fn key_update(&mut self, k: KeyEvent, steps: Vec<String>, done: Option<Result<String, String>>) {
+        let running = !steps.is_empty() && done.is_none();
+        match (k.code, &done) {
+            // finished: any of these closes; after a successful install the
+            // app exits and main relaunches the new version in this terminal
+            (KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('r'), Some(_)) => {
+                if self.restart {
+                    self.quit = true;
+                }
+            }
+            (_, Some(_)) => self.modal = Modal::Update { steps, done },
+            _ if running => self.modal = Modal::Update { steps, done },
+            (KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q'), None) => {}
+            (KeyCode::Char('y'), None) if self.update.is_some() => {
+                let tx = self.tx.clone();
+                logger::log("update: started from the TUI (Shift+U)");
+                std::thread::spawn(move || {
+                    let step_tx = tx.clone();
+                    let r = crate::update::self_update_with(&|line| {
+                        let _ = step_tx.send(AppEvent::UpdateStep(line.to_string()));
+                    });
+                    let _ = tx.send(AppEvent::UpdateDone(r));
+                });
+                self.modal = Modal::Update { steps: vec!["Starting update…".into()], done: None };
+            }
+            (KeyCode::Char('a'), None) => {
+                self.config.auto_update = !self.config.auto_update;
+                let on = self.config.auto_update;
+                match config::save(&self.config) {
+                    Ok(()) => self.info(if on {
+                        "automatic updates ON — new releases install when the app starts"
+                    } else {
+                        "automatic updates OFF"
+                    }),
+                    Err(e) => self.error(format!("settings not saved: {e}")),
+                }
+                self.modal = Modal::Update { steps, done };
+            }
+            _ => self.modal = Modal::Update { steps, done },
+        }
+    }
+
+    // ----- a: automatic backup schedule ---------------------------------------
+
+    fn open_schedule(&mut self) {
+        if !self.elevated {
+            self.error("administrator rights required to manage scheduled backups — restart from an elevated terminal");
+            return;
+        }
+        let Some(disk) = self.selected_disk().cloned() else {
+            self.error("no disk selected");
+            return;
+        };
+        let Some(dir) = self.config.backup_dir.clone() else {
+            self.error("set a backup destination first (n) — scheduled images go there");
+            return;
+        };
+        let mut s = self.config.schedule.clone().unwrap_or_default();
+        s.disk_serial = disk.serial.clone();
+        s.disk_name = disk.name.clone();
+        s.disk_size = disk.size;
+        s.dest_dir = dir;
+        let installed = self.config.schedule.is_some() && schedule::is_installed();
+        self.modal = Modal::Schedule { s, field: 0, installed };
+    }
+
+    fn key_schedule(&mut self, k: KeyEvent, mut s: Schedule, mut field: usize, installed: bool) {
+        let fields = schedule_fields(&s);
+        field = field.min(fields.len() - 1);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => {}
+            KeyCode::Up | KeyCode::Char('k') => {
+                field = (field + fields.len() - 1) % fields.len();
+                self.modal = Modal::Schedule { s, field, installed };
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                field = (field + 1) % fields.len();
+                self.modal = Modal::Schedule { s, field, installed };
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => {
+                schedule_adjust(&mut s, fields[field], -1);
+                self.modal = Modal::Schedule { s, field, installed };
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char(' ') => {
+                schedule_adjust(&mut s, fields[field], 1);
+                self.modal = Modal::Schedule { s, field, installed };
+            }
+            KeyCode::Enter => {
+                let desc = s.describe();
+                match schedule::install(&s) {
+                    Ok(()) => {
+                        self.config.schedule = Some(s);
+                        match config::save(&self.config) {
+                            Ok(()) => {
+                                logger::log(format!("scheduled backup registered: {desc}"));
+                                self.info(format!(
+                                    "scheduled backup saved — runs {desc} as task '{}'",
+                                    schedule::TASK_NAME
+                                ));
+                            }
+                            Err(e) => self.error(format!("task registered but settings not saved: {e}")),
+                        }
+                    }
+                    Err(e) => {
+                        self.error(format!("could not register the scheduled task: {e}"));
+                        self.modal = Modal::Schedule { s, field, installed };
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                let buf = self.config.backup_dir.clone().unwrap_or_default();
+                self.modal = Modal::Input { purpose: InputPurpose::BackupDir, buf };
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                let r = if installed { schedule::remove() } else { Ok(()) };
+                match r {
+                    Ok(()) => {
+                        self.config.schedule = None;
+                        match config::save(&self.config) {
+                            Ok(()) => self.info("scheduled backup removed"),
+                            Err(e) => self.error(format!("task removed but settings not saved: {e}")),
+                        }
+                    }
+                    Err(e) => {
+                        self.error(format!("could not remove the scheduled task: {e}"));
+                        self.modal = Modal::Schedule { s, field, installed };
+                    }
+                }
+            }
+            _ => self.modal = Modal::Schedule { s, field, installed },
         }
     }
 
