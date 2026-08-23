@@ -23,6 +23,18 @@ if (-not (Get-Command wingetcreate -ErrorAction SilentlyContinue)) {
     winget install --id Microsoft.WingetCreate --exact --accept-source-agreements --accept-package-agreements --silent | Out-Null
 }
 
+# Auto-detect the very first submission: `wingetcreate update` fails when the
+# package is not in winget-pkgs yet, so fall back to a new-package PR.
+if (-not $First) {
+    $probe = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/v/viorizz/diskutility"
+    try {
+        Invoke-RestMethod -Uri $probe -Headers @{ Authorization = "Bearer $Token"; 'User-Agent' = 'diskutility-release' } | Out-Null
+    } catch {
+        Write-Host "$id is not in winget-pkgs yet - doing the first submission."
+        $First = $true
+    }
+}
+
 if ($First) {
     # Generate manifests locally (deterministic, no prompts), validate, then submit them.
     & (Join-Path $PSScriptRoot 'make-manifests.ps1') -Version $Version

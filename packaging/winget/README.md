@@ -14,10 +14,14 @@ diskutility ships as a **portable** winget package (a bare exe, command alias
 `winget validate --manifest packaging/winget/manifests` checks the generated
 files locally.
 
-## First submission (one-time, manual)
+## First submission
+
+`submit.ps1` checks whether `viorizz.diskutility` already exists in
+winget-pkgs and, if not, does the new-package submission by itself — so the
+release workflow handles the first version too. To do it by hand instead:
 
 ```powershell
-./packaging/winget/submit.ps1 -Version 0.4.6 -Token $env:WINGET_TOKEN -First
+./packaging/winget/submit.ps1 -Version 0.4.7 -Token $env:WINGET_TOKEN -First
 ```
 
 The token is a GitHub personal access token with the `public_repo` scope;
@@ -31,4 +35,6 @@ New packages get a short manual review by Microsoft; after the PR merges,
 `submit.ps1 -Version <tag>` after the GitHub release is published, **if** the
 repository secret `WINGET_TOKEN` is set (Settings → Secrets → Actions). Without
 the secret the job prints a notice and exits successfully, so releases never
-fail because of winget.
+fail because of winget. A version whose release ran before the secret existed
+can be submitted afterwards from the Actions tab: *Release → Run workflow* with
+the tag (e.g. `v0.4.7`) — only the winget job runs.

@@ -3,12 +3,20 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Re-submit an already published version to winget by hand (e.g. the run
+  # that published it had no WINGET_TOKEN yet). Only the winget job runs.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published tag to submit to winget, e.g. v0.4.7"
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,9 +58,10 @@ jobs:
   winget:
     needs: release
     runs-on: windows-latest
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ always() && !contains(github.ref_name, '-') && (needs.release.result == 'success' || github.event_name == 'workflow_dispatch') }}
     env:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      WINGET_VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - name: Submit to winget
@@ -62,4 +71,4 @@ jobs:
             Write-Host "WINGET_TOKEN secret not set - skipping winget submission."
             exit 0
           }
-          ./packaging/winget/submit.ps1 -Version $env:GITHUB_REF_NAME -Token $env:WINGET_TOKEN
+          ./packaging/winget/submit.ps1 -Version $env:WINGET_VERSION -Token $env:WINGET_TOKEN
