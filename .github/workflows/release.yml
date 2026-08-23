@@ -8,28 +8,33 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Published tag to submit to winget, e.g. v0.4.7"
+        description: "Published tag to submit to winget, e.g. v0.1.0"
         required: true
 
 permissions:
   contents: write
+
+env:
+  PRODUCT: diskutility
 
 jobs:
   release:
     if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, toolchain pinned below
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build
         run: cargo build --release
       - name: Prepare assets
         shell: pwsh
         run: |
-          Copy-Item target/release/diskutility.exe diskutility.exe
-          $hash = (Get-FileHash diskutility.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  diskutility.exe" | Out-File -Encoding ascii checksums.txt
+          Copy-Item "target/release/$env:PRODUCT.exe" "$env:PRODUCT.exe"
+          $hash = (Get-FileHash "$env:PRODUCT.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:PRODUCT.exe" | Out-File -Encoding ascii checksums.txt
           Get-Content checksums.txt
       - name: Extract patch notes from CHANGELOG.md
         shell: pwsh
@@ -43,7 +48,7 @@ jobs:
           $notes | Out-File -Encoding utf8 RELEASE_NOTES.md
           Get-Content RELEASE_NOTES.md
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
@@ -51,10 +56,10 @@ jobs:
             diskutility.exe
             checksums.txt
 
-  # Publishes the new version to winget (microsoft/winget-pkgs) once the
-  # package exists there. Needs a repo secret WINGET_TOKEN: a GitHub PAT with
-  # `public_repo` scope, used by wingetcreate to fork winget-pkgs and open the
-  # PR. The job is skipped silently when the secret is not configured.
+  # Publishes the new version to winget once the package exists there. Needs
+  # a repo secret WINGET_TOKEN (GitHub PAT, `public_repo` scope) used by
+  # wingetcreate to fork winget-pkgs and open the PR. Skipped silently when
+  # the secret is not configured.
   winget:
     needs: release
     runs-on: windows-latest
@@ -63,7 +68,7 @@ jobs:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
       WINGET_VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Submit to winget
         shell: pwsh
         run: |

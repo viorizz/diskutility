@@ -11,6 +11,11 @@ comparison link is appended below these notes.
 ### Added
 - **Hex sector viewer (`x`)** — read-only browser of the selected disk's sectors, 16 bytes per row with an ASCII column: `←`/`→` step one sector, `PgUp`/`PgDn` jump 256, `Home`/`End`, `↑`/`↓` scroll on small terminals, `g` goes to a sector number (decimal or `0x…`) or a byte offset such as `1.5G` / `512M`. Well-known sectors are labelled: MBR / protective MBR, GPT header, NTFS, exFAT and FAT boot sectors, all-zero. Reads go through the raw device 4 KiB-aligned, so 4Kn drives work too. Needs an elevated terminal like every raw read.
 - **`diskutility --hex <disk> [sector]`** — the same dump from the command line.
+- **`diskutility --snapshot`** — renders one frame (after the disk scan) to stdout for layout checks and scripts.
+
+### Changed
+- **On utility-core v0.2.0's shared shell** — the event loop, `Shift+U` update dialog, `?` help overlay, status line and `--snapshot` are now the same code as in AccountUtility and MouseUtility (−400 lines here). Keys, layout and behaviour are unchanged; the help text keeps DiskUtility's rows and notes.
+- Release tooling: `packaging/release.ps1` (checks CHANGELOG + Cargo.toml agree, tags, pushes) and GitHub Actions pinned by commit SHA.
 - **New disk signature / GUID** in the manage menu (`m`) — after a clone, Windows keeps the copy offline because its MBR signature or GPT disk GUID collides with the source. This regenerates it through diskpart `uniqueid`, verifies the change, and the clone's success message now points at it. Goes through the same disk-identity check and protection rules as every manage action.
 
 ## v0.4.8 — 2026-08-23

@@ -3,33 +3,21 @@
 //! whether updates should be installed automatically on launch.
 
 use serde::{Deserialize, Serialize};
+use utility_core::config::CoreSettings;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// `auto_update` and `notify`, shared with every *Utility tool (flattened:
+    /// the JSON keys are unchanged).
+    #[serde(flatten)]
+    pub core: CoreSettings,
     /// Folder that backup images default to. Stored as typed by the user
     /// (after mapped-drive → UNC resolution, see `App::validate_backup_dir`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_dir: Option<String>,
-    /// Install a newer release automatically when the app starts (Shift+U → a).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub auto_update: bool,
     /// Automatic backup registered in Windows Task Scheduler (`a` key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<Schedule>,
-    /// Show a Windows toast when a scheduled backup finishes or fails.
-    /// Defaults to on; set `"notify": false` in config.json to silence it.
-    #[serde(default = "yes", skip_serializing_if = "Clone::clone")]
-    pub notify: bool,
-}
-
-fn yes() -> bool {
-    true
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config { backup_dir: None, auto_update: false, schedule: None, notify: true }
-    }
 }
 
 /// How often the scheduled backup runs. Mirrors `schtasks /SC`.

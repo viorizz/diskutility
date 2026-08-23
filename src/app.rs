@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{self, Config, Frequency, Schedule, MONTHS, WEEKDAYS};
+use utility_core::shell::{Help, Product, Shell};
 use crate::jobs;
 use crate::schedule;
 use crate::disks::{self, Disk};
@@ -16,10 +16,6 @@ use crate::ops::{self, ManageOp, OpEvent, Preset, PRESETS};
 pub enum AppEvent {
     Disks(Result<Vec<Disk>, String>),
     Op(OpEvent),
-    Update(String),
-    /// Progress line from an in-app update (Shift+U → y).
-    UpdateStep(String),
-    UpdateDone(Result<String, String>),
     Health(Result<ops::HealthReport, String>),
 }
 
@@ -122,10 +118,6 @@ fn schedule_adjust(s: &mut Schedule, f: SchedField, delta: i32) {
 }
 
 /// True when the startup update check was disabled by flag or env var.
-pub fn update_check_opted_out() -> bool {
-    utility_core::cli::update_check_opted_out(&crate::APP)
-}
-
 pub enum InputPurpose {
     Label(Preset),
     IsoPath,
@@ -303,7 +295,6 @@ pub struct ProgressState {
 
 pub enum Modal {
     None,
-    Help,
     Unlock { buf: String },
     Presets { idx: usize },
     EraseMenu { idx: usize },
@@ -316,9 +307,6 @@ pub enum Modal {
     Input { purpose: InputPurpose, buf: String },
     Confirm { action: PendingAction, buf: String },
     Progress(ProgressState),
-    /// Shift+U: offer to install an available update / toggle auto-update.
-    /// `steps` fills while the download runs; `done` ends it.
-    Update { steps: Vec<String>, done: Option<Result<String, String>> },
     /// `a`: edit the automatic backup schedule for the selected disk.
     Schedule { s: Schedule, field: usize, installed: bool },
     /// `m`: quick non-destructive actions for the selected disk.
@@ -352,24 +340,19 @@ pub fn pause_options(paused: bool) -> Vec<(&'static str, u64)> {
 }
 
 pub struct App {
+    /// Shared *Utility chrome: status line, tick, update check, elevation, help.
+    pub shell: Shell,
     pub disks: Vec<Disk>,
     pub selected: usize,
     pub scanning: bool,
-    pub elevated: bool,
     pub unlocked: bool,
-    pub update: Option<String>,
     pub modal: Modal,
-    pub status: Option<(String, bool, Instant)>,
-    pub tick: usize,
     pub config: Config,
     app_drive: Option<char>,
     /// Disk snapshotted by `guard()` for the action being configured/confirmed.
     pending_target: Option<Disk>,
     tx: mpsc::Sender<AppEvent>,
     rx: mpsc::Receiver<AppEvent>,
-    quit: bool,
-    /// Set after a successful in-app update: main relaunches the new exe.
-    restart: bool,
     /// Backups running in OTHER processes right now (polled from the jobs
     /// directory); drives the status bar, the Backups panel and the warning
     /// in the backup menu.
@@ -379,19 +362,29 @@ pub struct App {
 }
 
 impl App {
+    /// The real app: starts the disk scan and the shell's update check.
     pub fn new() -> Self {
+        let mut app = Self::with_shell(Shell::new(&crate::APP, crate::ui::THEME));
+        app.refresh();
+        app
+    }
+
+    /// No network, no scan — for tests.
+    #[cfg(test)]
+    pub fn offline() -> Self {
+        Self::with_shell(Shell::offline(&crate::APP, crate::ui::THEME))
+    }
+
+    fn with_shell(shell: Shell) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
+            shell,
             config: config::load(),
             disks: Vec::new(),
             selected: 0,
             scanning: false,
-            elevated: ops::is_elevated(),
             unlocked: false,
-            update: None,
             modal: Modal::None,
-            status: None,
-            tick: 0,
             pending_target: None,
             app_drive: std::env::current_exe()
                 .ok()
@@ -399,74 +392,42 @@ impl App {
                 .map(|c| c.to_ascii_uppercase()),
             tx,
             rx,
-            quit: false,
-            restart: false,
             jobs: Vec::new(),
             publisher: None,
         }
     }
 
-    pub fn restart_requested(&self) -> bool {
-        self.restart
-    }
-
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        self.refresh();
-        // Startup update check is the only network access in the TUI; it can
-        // be switched off with --no-update-check or DISKUTILITY_NO_UPDATE_CHECK=1.
-        if update_check_opted_out() {
-            logger::log("update check skipped (opted out)");
-        } else {
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                if let Ok(Some((tag, _))) = crate::update::check_latest() {
-                    let _ = tx.send(AppEvent::Update(tag));
-                }
-            });
-        }
-        while !self.quit {
-            self.tick = self.tick.wrapping_add(1);
-            // ~every 0.8 s: which backups are running in other processes?
-            if self.tick % 10 == 1 {
-                let now = jobs::others();
-                for gone in self.jobs.iter().filter(|j| !now.iter().any(|n| n.pid == j.pid)) {
-                    self.status = Some((
-                        format!("{} backup of {} finished — see diskutility.log for the result", gone.kind.label(), gone.disk),
-                        false,
-                        Instant::now(),
-                    ));
-                }
-                self.jobs = now;
-                // our own backup may have been asked to stop from another window
-                if let (Some(pubr), Modal::Progress(p)) = (&mut self.publisher, &self.modal) {
-                    if p.done.is_none() && pubr.cancel_requested() && !p.cancel.load(Ordering::Relaxed) {
-                        p.cancel.store(true, Ordering::Relaxed);
-                        pubr.mark_cancelling();
-                        logger::log("backup: stop requested from another diskutility window");
-                    }
-                }
+    /// Once per loop iteration: other processes' backups, our publisher
+    /// heartbeat, and the product event channel.
+    fn tick(&mut self) {
+        // ~every second: which backups are running in other processes?
+        if self.shell.tick % 10 == 1 {
+            let now = jobs::others();
+            let finished: Vec<String> = self
+                .jobs
+                .iter()
+                .filter(|j| !now.iter().any(|n| n.pid == j.pid))
+                .map(|gone| format!("{} backup of {} finished — see diskutility.log for the result", gone.kind.label(), gone.disk))
+                .collect();
+            for msg in finished {
+                self.shell.set_status(msg, false);
             }
-            if let Some(pubr) = &mut self.publisher {
-                pubr.heartbeat();
-            }
-            if let Some((_, _, t)) = &self.status {
-                if t.elapsed() > Duration::from_secs(5) {
-                    self.status = None;
-                }
-            }
-            terminal.draw(|f| crate::ui::draw(f, self))?;
-            while let Ok(ev) = self.rx.try_recv() {
-                self.on_app_event(ev);
-            }
-            if event::poll(Duration::from_millis(80))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        self.on_key(k);
-                    }
+            self.jobs = now;
+            // our own backup may have been asked to stop from another window
+            if let (Some(pubr), Modal::Progress(p)) = (&mut self.publisher, &self.modal) {
+                if p.done.is_none() && pubr.cancel_requested() && !p.cancel.load(Ordering::Relaxed) {
+                    p.cancel.store(true, Ordering::Relaxed);
+                    pubr.mark_cancelling();
+                    logger::log("backup: stop requested from another diskutility window");
                 }
             }
         }
-        Ok(())
+        if let Some(pubr) = &mut self.publisher {
+            pubr.heartbeat();
+        }
+        while let Ok(ev) = self.rx.try_recv() {
+            self.on_app_event(ev);
+        }
     }
 
     fn on_app_event(&mut self, ev: AppEvent) {
@@ -515,25 +476,6 @@ impl App {
                     }
                 }
             }
-            AppEvent::Update(tag) => {
-                logger::log(format!("update available: {tag}"));
-                self.update = Some(tag);
-            }
-            AppEvent::UpdateStep(line) => {
-                if let Modal::Update { steps, .. } = &mut self.modal {
-                    steps.push(line);
-                }
-            }
-            AppEvent::UpdateDone(r) => {
-                if let Ok(m) = &r {
-                    if crate::update::updated(m) {
-                        self.restart = true;
-                    }
-                }
-                if let Modal::Update { done, .. } = &mut self.modal {
-                    *done = Some(r);
-                }
-            }
             AppEvent::Health(r) => {
                 match &r {
                     Ok(h) => logger::log(format!("health: {h:?}")),
@@ -558,15 +500,11 @@ impl App {
     }
 
     fn info(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        logger::log(format!("status: {msg}"));
-        self.status = Some((msg, false, Instant::now()));
+        self.shell.set_status(msg, false);
     }
 
     fn error(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        logger::log(format!("ERROR: {msg}"));
-        self.status = Some((msg, true, Instant::now()));
+        self.shell.set_status(msg, true);
     }
 
     fn copy_log(&mut self) {
@@ -656,7 +594,7 @@ impl App {
             ));
             return false;
         }
-        if !self.elevated {
+        if !self.shell.elevated {
             self.error("administrator rights required — restart this app from an elevated terminal");
             return false;
         }
@@ -675,7 +613,7 @@ impl App {
             ));
             return false;
         }
-        if !self.elevated {
+        if !self.shell.elevated {
             self.error("administrator rights required — restart this app from an elevated terminal");
             return false;
         }
@@ -785,7 +723,7 @@ impl App {
         }
         let p = std::path::Path::new(&dir);
         if !p.is_dir() {
-            let hint = if letter.is_some() && self.elevated {
+            let hint = if letter.is_some() && self.shell.elevated {
                 r" (mapped network drives are often invisible to an elevated process — use the \\server\share form)"
             } else {
                 ""
@@ -977,25 +915,25 @@ impl App {
         out
     }
 
-    fn on_key(&mut self, k: KeyEvent) {
-        // Ctrl+C: cancel a running op, otherwise quit.
+    /// Product keys. Returns true when consumed; false lets the shell apply
+    /// its globals (`?`, `U`, `c`, `q`, `Esc`, `Ctrl+C`).
+    fn on_key(&mut self, k: KeyEvent) -> bool {
+        // Ctrl+C while an op runs: cancel it instead of quitting.
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             if let Modal::Progress(p) = &self.modal {
                 if p.done.is_none() {
                     if p.cancellable {
                         p.cancel.store(true, Ordering::Relaxed);
                     }
-                    return;
+                    return true;
                 }
             }
-            self.quit = true;
-            return;
+            return false;
         }
 
         let modal = std::mem::replace(&mut self.modal, Modal::None);
         match modal {
-            Modal::None => self.key_normal(k),
-            Modal::Help => { /* any key closes help */ }
+            Modal::None => return self.key_normal(k),
             Modal::Unlock { mut buf } => match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Backspace => {
@@ -1112,7 +1050,7 @@ impl App {
             },
             Modal::Hex(mut v) => {
                 match k.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => return,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => return true,
                     KeyCode::Left | KeyCode::Char('h') => v.step(-1),
                     KeyCode::Right | KeyCode::Char('l') => v.step(1),
                     KeyCode::PageUp => v.step(-256),
@@ -1123,7 +1061,7 @@ impl App {
                     KeyCode::Down => v.row = (v.row + 1).min(31),
                     KeyCode::Char('g') => {
                         self.modal = Modal::Input { purpose: InputPurpose::GotoLba(v), buf: String::new() };
-                        return;
+                        return true;
                     }
                     KeyCode::Char('c') => self.copy_log(),
                     _ => {}
@@ -1380,7 +1318,6 @@ impl App {
                     _ => self.modal = Modal::ManageMenu { idx },
                 }
             }
-            Modal::Update { steps, done } => self.key_update(k, steps, done),
             Modal::Schedule { s, field, installed } => self.key_schedule(k, s, field, installed),
             Modal::Progress(p) => {
                 if k.code == KeyCode::Char('c') {
@@ -1400,11 +1337,11 @@ impl App {
                 }
             }
         }
+        true
     }
 
-    fn key_normal(&mut self, k: KeyEvent) {
+    fn key_normal(&mut self, k: KeyEvent) -> bool {
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected > 0 {
                     self.selected -= 1;
@@ -1423,7 +1360,6 @@ impl App {
                 self.refresh();
                 self.info("rescanning disks…");
             }
-            KeyCode::Char('c') => self.copy_log(),
             KeyCode::Char('u') => {
                 if self.unlocked {
                     self.unlocked = false;
@@ -1433,12 +1369,10 @@ impl App {
                     self.modal = Modal::Unlock { buf: String::new() };
                 }
             }
-            KeyCode::Char('?') => self.modal = Modal::Help,
-            KeyCode::Char('U') => self.modal = Modal::Update { steps: Vec::new(), done: None },
             KeyCode::Char('B') | KeyCode::Char('X') => self.modal = Modal::Backups { idx: 0 },
             KeyCode::Char('a') => self.open_schedule(),
             KeyCode::Char('m') => {
-                if !self.elevated {
+                if !self.shell.elevated {
                     self.error("administrator rights required — restart this app from an elevated terminal");
                 } else if self.selected_disk().is_some() {
                     self.modal = Modal::ManageMenu { idx: 0 };
@@ -1487,7 +1421,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') => {
-                if !self.elevated {
+                if !self.shell.elevated {
                     self.error("administrator rights required — restart this app from an elevated terminal");
                 } else if self.selected_disk().is_some() {
                     self.modal = Modal::BackupMenu { idx: 0 };
@@ -1500,7 +1434,7 @@ impl App {
                 self.modal = Modal::Input { purpose: InputPurpose::BackupDir, buf };
             }
             KeyCode::Char('d') => {
-                if !self.elevated {
+                if !self.shell.elevated {
                     self.error("administrator rights required — restart this app from an elevated terminal");
                 } else if self.selected_disk().is_some() {
                     self.modal = Modal::Input { purpose: InputPurpose::CloneTarget, buf: String::new() };
@@ -1508,8 +1442,9 @@ impl App {
                     self.error("no disk selected");
                 }
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     // ----- m: manage menu -------------------------------------------------------
@@ -1577,52 +1512,10 @@ impl App {
 
     // ----- Shift+U: update dialog -------------------------------------------
 
-    fn key_update(&mut self, k: KeyEvent, steps: Vec<String>, done: Option<Result<String, String>>) {
-        let running = !steps.is_empty() && done.is_none();
-        match (k.code, &done) {
-            // finished: any of these closes; after a successful install the
-            // app exits and main relaunches the new version in this terminal
-            (KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('r'), Some(_)) => {
-                if self.restart {
-                    self.quit = true;
-                }
-            }
-            (_, Some(_)) => self.modal = Modal::Update { steps, done },
-            _ if running => self.modal = Modal::Update { steps, done },
-            (KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q'), None) => {}
-            (KeyCode::Char('y'), None) if self.update.is_some() => {
-                let tx = self.tx.clone();
-                logger::log("update: started from the TUI (Shift+U)");
-                std::thread::spawn(move || {
-                    let step_tx = tx.clone();
-                    let r = crate::update::self_update_with(&|line| {
-                        let _ = step_tx.send(AppEvent::UpdateStep(line.to_string()));
-                    });
-                    let _ = tx.send(AppEvent::UpdateDone(r));
-                });
-                self.modal = Modal::Update { steps: vec!["Starting update…".into()], done: None };
-            }
-            (KeyCode::Char('a'), None) => {
-                self.config.auto_update = !self.config.auto_update;
-                let on = self.config.auto_update;
-                match config::save(&self.config) {
-                    Ok(()) => self.info(if on {
-                        "automatic updates ON — new releases install when the app starts"
-                    } else {
-                        "automatic updates OFF"
-                    }),
-                    Err(e) => self.error(format!("settings not saved: {e}")),
-                }
-                self.modal = Modal::Update { steps, done };
-            }
-            _ => self.modal = Modal::Update { steps, done },
-        }
-    }
-
     // ----- a: automatic backup schedule ---------------------------------------
 
     fn open_schedule(&mut self) {
-        if !self.elevated {
+        if !self.shell.elevated {
             self.error("administrator rights required to manage scheduled backups — restart from an elevated terminal");
             return;
         }
@@ -1804,7 +1697,7 @@ impl App {
             self.error("refusing to touch a protected disk (press u to override)");
             return;
         }
-        if !self.elevated {
+        if !self.shell.elevated {
             self.error("administrator rights required — restart this app from an elevated terminal");
             return;
         }
@@ -1882,7 +1775,7 @@ impl App {
     /// confirm dialog and are allowed even on protected disks — they only
     /// need elevation.
     fn start_safe_test(&mut self, surface_scan: bool) {
-        if !self.elevated {
+        if !self.shell.elevated {
             self.error("administrator rights required — restart this app from an elevated terminal");
             return;
         }
@@ -1939,5 +1832,41 @@ fn sanitize_label(raw: &str, preset: Preset) -> String {
         "UNTITLED".into()
     } else {
         cleaned
+    }
+}
+
+impl Product for App {
+    fn shell(&self) -> &Shell {
+        &self.shell
+    }
+    fn shell_mut(&mut self) -> &mut Shell {
+        &mut self.shell
+    }
+    fn core_settings(&self) -> &utility_core::config::CoreSettings {
+        &self.config.core
+    }
+    fn core_settings_mut(&mut self) -> &mut utility_core::config::CoreSettings {
+        &mut self.config.core
+    }
+    fn save_config(&self) -> Result<(), String> {
+        config::save(&self.config)
+    }
+    fn hints(&self) -> &[utility_core::ui::Hint] {
+        crate::ui::hints(self.unlocked)
+    }
+    fn help(&self) -> Help {
+        crate::ui::help()
+    }
+    fn draw(&self, f: &mut ratatui::Frame) {
+        crate::ui::draw(f, self)
+    }
+    fn on_key(&mut self, k: KeyEvent) -> bool {
+        App::on_key(self, k)
+    }
+    fn on_tick(&mut self) {
+        self.tick()
+    }
+    fn loading(&self) -> bool {
+        self.scanning
     }
 }

@@ -3,7 +3,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
-use utility_core::ui::{draw_footer as core_footer, draw_header as core_header, modal_block, spinner, HeaderStatus, Hint, Theme};
+use utility_core::shell::Help;
+use utility_core::ui::{modal_block, Hint, Theme};
 
 use crate::app::{HexView, pause_options, schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
 use crate::config::Schedule;
@@ -47,7 +48,6 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     match &app.modal {
         Modal::None => {}
-        Modal::Help => draw_help(f, area),
         Modal::Unlock { buf } => draw_unlock(f, area, buf),
         Modal::Presets { idx } => draw_presets(f, area, *idx),
         Modal::EraseMenu { idx } => draw_erase_menu(f, area, *idx),
@@ -58,7 +58,6 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::Input { purpose, buf } => draw_input(f, area, app, purpose, buf),
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
         Modal::Progress(p) => draw_progress(f, area, app, p),
-        Modal::Update { steps, done } => draw_update(f, area, app, steps, done.as_ref()),
         Modal::Schedule { s, field, installed } => draw_schedule(f, area, app, s, *field, *installed),
         Modal::ManageMenu { idx } => draw_manage_menu(f, area, app, *idx),
         Modal::Backups { idx } => draw_backups(f, area, app, *idx),
@@ -77,14 +76,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     if app.unlocked {
         badges.push(Span::styled("⛨ PROTECTIONS OFF", Style::new().fg(ERR_C).bold()));
     }
-    let status = HeaderStatus {
-        update_available: app.update.clone(),
-        badges,
-        alert: app.unlocked,
-        show_elevation: true,
-        elevated: app.elevated,
-    };
-    core_header(f, area, &THEME, &crate::APP, &status);
+    let mut status = app.shell.header_status();
+    status.badges = badges;
+    status.alert = app.unlocked;
+    app.shell.draw_header(f, area, &status);
 }
 
 fn draw_disk_list(f: &mut Frame, area: Rect, app: &App) {
@@ -92,7 +87,7 @@ fn draw_disk_list(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(" Disks ", Style::new().fg(TEXT).bold()),
             Span::styled(
-                format!("{} scanning… ", spinner(app.tick)),
+                format!("{} scanning… ", app.shell.spinner()),
                 Style::new().fg(ACCENT_SOFT),
             ),
         ])
@@ -272,7 +267,7 @@ fn draw_jobs_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(tag, Style::new().fg(WARN_C).bold()),
-            Span::styled(spinner(app.tick), Style::new().fg(WARN_C)),
+            Span::styled(app.shell.spinner(), Style::new().fg(WARN_C)),
         ])),
         cols[0],
     );
@@ -483,27 +478,52 @@ fn draw_pause_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+const HINTS_LOCKED: &[Hint] = &[
+    ("↑↓", "select"),
+    ("f", "format"),
+    ("e", "erase"),
+    ("i", "write"),
+    ("s", "backup"),
+    ("n", "backup dir"),
+    ("d", "clone"),
+    ("a", "auto"),
+    ("m", "manage"),
+    ("b", "test"),
+    ("h", "health"),
+    ("x", "hex"),
+    ("r", "rescan"),
+    ("c", "log"),
+    ("u", "override"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+const HINTS_UNLOCKED: &[Hint] = &[
+    ("↑↓", "select"),
+    ("f", "format"),
+    ("e", "erase"),
+    ("i", "write"),
+    ("s", "backup"),
+    ("n", "backup dir"),
+    ("d", "clone"),
+    ("a", "auto"),
+    ("m", "manage"),
+    ("b", "test"),
+    ("h", "health"),
+    ("x", "hex"),
+    ("r", "rescan"),
+    ("c", "log"),
+    ("u", "re-lock"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+
+/// Footer hints; the `u` label flips with the safety override.
+pub fn hints(unlocked: bool) -> &'static [Hint] {
+    if unlocked { HINTS_UNLOCKED } else { HINTS_LOCKED }
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let hints: &[Hint] = &[
-        ("↑↓", "select"),
-        ("f", "format"),
-        ("e", "erase"),
-        ("i", "write"),
-        ("s", "backup"),
-        ("n", "backup dir"),
-        ("d", "clone"),
-        ("a", "auto"),
-        ("m", "manage"),
-        ("b", "test"),
-        ("h", "health"),
-        ("x", "hex"),
-        ("r", "rescan"),
-        ("c", "log"),
-        ("u", if app.unlocked { "re-lock" } else { "override" }),
-        ("?", "help"),
-        ("q", "quit"),
-    ];
-    core_footer(f, area, &THEME, app.status.as_ref().map(|(m, e, _)| (m.as_str(), *e)), hints);
+    app.shell.draw_footer(f, area, hints(app.unlocked));
 }
 
 // ---------------------------------------------------------------------------
@@ -907,7 +927,7 @@ fn draw_progress(f: &mut Frame, area: Rect, app: &App, p: &ProgressState) {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!("{} ", spinner(app.tick)),
+                        format!("{} ", app.shell.spinner()),
                         Style::new().fg(ACCENT_SOFT).bold(),
                     ),
                     Span::styled(format!("working… {secs}s"), Style::new().fg(TEXT)),
@@ -987,7 +1007,7 @@ fn draw_health(
     let lines: Vec<Line> = match report {
         None => vec![Line::from(vec![
             Span::styled(
-                format!("{} ", spinner(app.tick)),
+                format!("{} ", app.shell.spinner()),
                 Style::new().fg(ACCENT_SOFT).bold(),
             ),
             Span::styled("querying drive health…", Style::new().fg(TEXT)),
@@ -1053,7 +1073,7 @@ fn draw_health(
                     if h.write_err < 0 { na() } else { h.write_err.to_string() },
                     err_c(h.write_err),
                 ));
-            } else if !app.elevated {
+            } else if !app.shell.elevated {
                 v.push(Line::from(Span::styled(
                     "Detailed counters require an elevated (administrator) terminal — restart the app elevated for wear, temperature and error data.",
                     Style::new().fg(WARN_C),
@@ -1072,145 +1092,32 @@ fn draw_health(
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 29, "Help", ACCENT);
-    let key = |k: &'static str, d: &'static str| {
-        Line::from(vec![
-            Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
-            Span::styled(d, Style::new().fg(TEXT)),
-        ])
-    };
-    let note = |t: &'static str| Line::from(Span::styled(t, Style::new().fg(DIM)));
-    let lines = vec![
-        key("↑↓ / jk", "select a disk"),
-        key("f", "format — Windows, macOS, Linux, PS5 or Universal preset"),
-        key("e", "erase — quick (partition table) or secure (zero-fill)"),
-        key("i", "write a bootable .iso/.img image to the disk (verified)"),
-        key("b", "benchmark, surface scan & capacity tests"),
-        key("h", "drive health: SMART wear, temperature, hours, error counts"),
-        key("s", "backup the whole disk to an .img file (restore with i)"),
-        key("n", "set a network drive / folder as the default backup destination"),
-        key("d", "clone the disk sector-for-sector onto another disk (verified)"),
-        key("a", "automatic backups — schedule a Task Scheduler job for the disk"),
-        key("m", "manage: drive letters, volume label, online/offline, eject, read-only, new signature"),
-        key("x", "hex sector viewer (read-only): ←→ sector, PgUp/PgDn ±256, g go to, Home/End"),
-        key("Shift+U", "install an available update / toggle auto-update on launch"),
-        key("Shift+B", "backups panel: running jobs (x stop), schedule (p pause), resumable images"),
-        key("r", "rescan disks"),
-        key("c", "copy the full session log to the clipboard (bug reports)"),
-        key("u", "toggle safety override — allow protected disks (DANGEROUS)"),
-        key("q / Esc", "quit"),
-        Line::default(),
-        Line::from(Span::styled(
-            format!(
-                "  Log file: {}",
-                crate::logger::path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "unavailable".into())
-            ),
-            Style::new().fg(DIM),
-        )),
-        note("Destructive operations require an elevated (administrator)"),
-        note("terminal and typing the disk number to confirm."),
-        note("The Windows system/boot disk is always protected."),
-        Line::default(),
-        note("macOS preset uses exFAT (APFS/HFS+ can only be created by a Mac)."),
-        note("Linux preset builds real ext4 through WSL 2."),
-        note("PS5 media/backup drives use exFAT; game storage is formatted by the console."),
-        Line::default(),
-        note("press any key to close"),
-    ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn draw_update(
-    f: &mut Frame,
-    area: Rect,
-    app: &App,
-    steps: &[String],
-    done: Option<&Result<String, String>>,
-) {
-    let color = match done {
-        Some(Ok(_)) => OK_C,
-        Some(Err(_)) => ERR_C,
-        None => ACCENT,
-    };
-    let h = 13 + steps.len().min(8) as u16;
-    let inner = modal_block(f, area, 76, h, "Update", color);
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("Installed  ", Style::new().fg(DIM)),
-        Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), Style::new().fg(TEXT).bold()),
-        Span::styled("   Latest  ", Style::new().fg(DIM)),
-        match &app.update {
-            Some(tag) => Span::styled(tag.clone(), Style::new().fg(ACCENT_SOFT).bold()),
-            None => Span::styled("no newer release found", Style::new().fg(TEXT)),
-        },
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Auto-update on launch  ", Style::new().fg(DIM)),
-        if app.config.auto_update {
-            Span::styled("ON", Style::new().fg(OK_C).bold())
-        } else {
-            Span::styled("off", Style::new().fg(TEXT))
-        },
-    ]));
-    lines.push(Line::default());
-    if steps.is_empty() && done.is_none() {
-        if app.update.is_some() {
-            lines.push(Line::from(Span::styled(
-                "Download the new release, verify its SHA-256 against the published checksums, and restart into it?",
-                Style::new().fg(TEXT),
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "y  update now   ·   n  not now   ·   a  toggle auto-update on launch",
-                Style::new().fg(DIM),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "You are running the latest version (or the startup check is still running / disabled).",
-                Style::new().fg(TEXT),
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "a  toggle auto-update on launch   ·   Esc  close",
-                Style::new().fg(DIM),
-            )));
-        }
-    } else {
-        for st in steps.iter().rev().take(8).rev() {
-            lines.push(Line::from(vec![
-                Span::styled("  · ", Style::new().fg(DIM)),
-                Span::styled(st.clone(), Style::new().fg(TEXT)),
-            ]));
-        }
-        lines.push(Line::default());
-        match done {
-            None => lines.push(Line::from(Span::styled(
-                format!("{} working — please wait", spinner(app.tick)),
-                Style::new().fg(ACCENT_SOFT),
-            ))),
-            Some(Ok(m)) => {
-                lines.push(Line::from(Span::styled(m.clone(), Style::new().fg(OK_C))));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    if crate::update::updated(m) {
-                        "Enter  restart into the new version now"
-                    } else {
-                        "Enter  close"
-                    },
-                    Style::new().fg(DIM),
-                )));
-            }
-            Some(Err(e)) => {
-                lines.push(Line::from(Span::styled(format!("✗ {e}"), Style::new().fg(ERR_C))));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled("Enter  close", Style::new().fg(DIM))));
-            }
-        }
-    }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+/// Content of the `?` overlay (drawn by the shell).
+pub fn help() -> Help {
+    let log = crate::logger::path().map(|p| p.display().to_string()).unwrap_or_else(|| "unavailable".into());
+    Help::from_hints(&[])
+        .width(90)
+        .row("↑↓ / jk", "select a disk")
+        .row("f", "format — Windows, macOS, Linux, PS5 or Universal preset")
+        .row("e", "erase — quick (partition table) or secure (zero-fill)")
+        .row("i", "write a bootable .iso/.img image to the disk (verified)")
+        .row("b", "benchmark, surface scan & capacity tests")
+        .row("h", "drive health: SMART wear, temperature, hours, error counts")
+        .row("s", "backup the whole disk to an .img file (restore with i)")
+        .row("n", "set a network drive / folder as the default backup destination")
+        .row("d", "clone the disk sector-for-sector onto another disk (verified)")
+        .row("a", "automatic backups — schedule a Task Scheduler job for the disk")
+        .row("m", "manage: drive letters, volume label, online/offline, eject, read-only, new signature")
+        .row("x", "hex sector viewer (read-only): ←→ sector, PgUp/PgDn ±256, g go to, Home/End")
+        .row("Shift+U", "install an available update / toggle auto-update on launch")
+        .row("Shift+B", "backups panel: running jobs (x stop), schedule (p pause), resumable images")
+        .row("r", "rescan disks")
+        .row("c", "copy the full session log to the clipboard (bug reports)")
+        .row("u", "toggle safety override — allow protected disks (DANGEROUS)")
+        .row("q / Esc", "quit")
+        .note(format!("Log file: {log}"))
+        .note("Destructive operations require an elevated (administrator) terminal and typing the disk number to confirm. The Windows system/boot disk is always protected.")
+        .note("macOS preset uses exFAT (APFS/HFS+ can only be created by a Mac). Linux preset builds real ext4 through WSL 2. PS5 media/backup drives use exFAT; game storage is formatted by the console.")
 }
 
 fn draw_schedule(f: &mut Frame, area: Rect, app: &App, s: &Schedule, field: usize, installed: bool) {
@@ -1425,6 +1332,49 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// The whole stack through the shell: frame renders, `?` opens the shared
+    /// help with our rows, `x` on an empty disk list reports an error in the
+    /// footer, `u` opens the unlock prompt (a product modal, so `q` must not quit).
+    #[test]
+    fn shell_drives_keys_and_renders() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use std::time::Duration;
+        use utility_core::shell::{handle_key, snapshot, Product};
+        utility_core::register(&crate::APP);
+        let mut app = App::offline();
+        let frame = snapshot(&mut app, 120, 36, Duration::ZERO).unwrap();
+        assert!(frame.contains("Disk Utility"), "{frame}");
+        assert!(frame.contains("f format"), "footer hints: {frame}");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('?')));
+        let frame = snapshot(&mut app, 120, 40, Duration::ZERO).unwrap();
+        assert!(frame.contains("hex sector viewer"), "help rows: {frame}");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.shell().status_ref(), Some(("no disk selected", true)));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('u')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('q')));
+        assert!(!app.shell().quit, "q inside the unlock prompt must type, not quit");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.shell().quit);
+    }
+
+    #[test]
+    fn renders_with_disks() {
+        use std::time::Duration;
+        use utility_core::shell::snapshot;
+        utility_core::register(&crate::APP);
+        let mut app = App::offline();
+        let mut d = crate::disks::Disk { number: 1, name: "WD BLACK".into(), serial: "S1".into(), size: 2_000_000_000_000, bus: "NVMe".into(), style: "GPT".into(), ..Default::default() };
+        d.partitions.push(crate::disks::Partition { number: 1, letter: "G".into(), size: 1_999_000_000_000, kind: "Basic".into(), fs: "NTFS".into(), label: "Data".into(), free: 5_000_000_000 });
+        app.disks = vec![d.clone(), crate::disks::Disk { number: 0, system: true, boot: true, ..d.clone() }, crate::disks::Disk { number: 2, ..d }];
+        let frame = snapshot(&mut app, 120, 36, Duration::ZERO).unwrap();
+        assert!(frame.contains("WD BLACK"), "{frame}");
+    }
+
     fn mbr() -> Vec<u8> {
         let mut d = vec![0u8; 512];
         d[0x1c2] = 0xee;
@@ -1476,7 +1426,7 @@ mod tests {
     #[test]
     fn sched_status_bar_renders() {
         utility_core::register(&crate::APP);
-        let mut app = App::new();
+        let mut app = App::offline();
         app.jobs = vec![jobs::Job {
             pid: 1,
             kind: jobs::Kind::Scheduled,

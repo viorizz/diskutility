@@ -11,7 +11,7 @@ mod schedule;
 mod ui;
 
 // Shared with the other *Utility tools.
-pub use utility_core::{logger, notify, update};
+pub use utility_core::{logger, notify};
 
 use utility_core::{cli, AppInfo};
 
@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
     // `diskutility --scheduled-backup` — headless run launched by the
     // Task Scheduler job registered with the `a` key.
     if std::env::args().any(|a| a == schedule::CLI_FLAG) {
-        let notify = config::load().notify;
+        let notify = config::load().core.notify;
         return match schedule::run_headless() {
             Ok(schedule::Outcome::Skipped(msg)) => {
                 println!("{msg}");
@@ -100,6 +100,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // `diskutility --snapshot` — render one frame after the disk scan and exit.
+    if std::env::args().any(|a| a == "--snapshot") {
+        let mut app = app::App::new();
+        print!("{}", utility_core::shell::snapshot(&mut app, 120, 36, std::time::Duration::from_secs(15))?);
+        return Ok(());
+    }
+
     // Non-interactive mode for quick checks / scripting: `diskutility --list`
     if std::env::args().any(|a| a == "--list" || a == "-l") {
         return list_disks();
@@ -107,18 +114,10 @@ fn main() -> anyhow::Result<()> {
 
     // Opt-in automatic update on launch (Shift+U → a in the TUI). Network
     // access still honours --no-update-check / DISKUTILITY_NO_UPDATE_CHECK.
-    cli::auto_update_on_launch(&APP, config::load().auto_update);
+    cli::auto_update_on_launch(&APP, config::load().core.auto_update);
 
-    let mut terminal = ratatui::init();
-    let _ = utility_core::ui::set_terminal_title(&APP);
     let mut app = app::App::new();
-    let result = app.run(&mut terminal);
-    ratatui::restore();
-    if app.restart_requested() {
-        println!("diskutility: restarting into the new version…");
-        std::process::exit(update::relaunch().map_err(|e| anyhow::anyhow!(e))?);
-    }
-    result
+    std::process::exit(utility_core::shell::launch(&mut app)?);
 }
 
 fn list_disks() -> anyhow::Result<()> {
