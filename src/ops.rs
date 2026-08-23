@@ -1,23 +1,17 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-
 use crate::app::AppEvent;
 use crate::disks::{human, Disk};
 use crate::logger;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CHUNK: usize = 4 * 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -93,139 +87,11 @@ impl Preset {
 }
 
 // ---------------------------------------------------------------------------
-// PowerShell plumbing
+// PowerShell plumbing — shared with the other *Utility tools via utility-core
 // ---------------------------------------------------------------------------
 
-pub fn run_ps(script: &str) -> Result<String, String> {
-    run_ps_impl(script, true)
-}
-
-/// Same as run_ps but only writes to the log when the command fails —
-/// used for the frequent disk rescans so the log stays readable.
-pub fn run_ps_quiet(script: &str) -> Result<String, String> {
-    run_ps_impl(script, false)
-}
-
-/// Prepended to every script: silence progress records (they pollute stderr
-/// as CLIXML), force UTF-8 output so unicode survives the pipe, and pin the
-/// module search path to system-owned directories so a module dropped in the
-/// user's Documents folder can't shadow the Storage cmdlets while we run
-/// elevated.
-const PS_PRELUDE: &str = "$ProgressPreference='SilentlyContinue'\n\
-    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}\n\
-    $env:PSModulePath = \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\Modules;$env:ProgramFiles\\WindowsPowerShell\\Modules\"\n";
-
-/// Absolute path of Windows PowerShell. `Command::new("powershell")` would
-/// search the directory of our own exe first — which is user-writable when
-/// installed to %LOCALAPPDATA% — and we usually run elevated, so never resolve
-/// the interpreter by name.
-pub fn powershell_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
-}
-
-/// Escape a value for use inside a single-quoted PowerShell string literal.
-pub fn ps_quote(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-fn run_ps_impl(script: &str, verbose: bool) -> Result<String, String> {
-    if verbose {
-        logger::log_block("powershell script", script);
-    }
-    let full_script = format!("{PS_PRELUDE}{script}");
-    let utf16: Vec<u8> = full_script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let encoded = B64.encode(&utf16);
-    let started = Instant::now();
-    let out = Command::new(powershell_exe())
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            &encoded,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| {
-            logger::log(format!("FAILED to launch powershell: {e}"));
-            format!("failed to launch powershell: {e}")
-        })?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr_raw = String::from_utf8_lossy(&out.stderr).to_string();
-    let stderr = decode_clixml(&stderr_raw).unwrap_or(stderr_raw);
-    let code = out.status.code();
-
-    let log_result = |header: &str| {
-        logger::log(format!(
-            "{header}: exit code {code:?} after {:.1}s",
-            started.elapsed().as_secs_f64()
-        ));
-        if !stdout.trim().is_empty() {
-            logger::log_block("stdout", stdout.trim());
-        }
-        if !stderr.trim().is_empty() {
-            logger::log_block("stderr", stderr.trim());
-        }
-    };
-
-    if out.status.success() {
-        if verbose {
-            log_result("powershell ok");
-        }
-        Ok(stdout)
-    } else {
-        if !verbose {
-            // quiet mode still dumps everything on failure
-            logger::log_block("powershell script (failed)", script);
-        }
-        log_result("powershell FAILED");
-        let msg = if stderr.trim().is_empty() { &stdout } else { &stderr };
-        let short: Vec<&str> = msg
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('+') && !l.starts_with("At line"))
-            .take(4)
-            .collect();
-        Err(if short.is_empty() {
-            "powershell command failed (press c to copy the full log)".into()
-        } else {
-            short.join(" ")
-        })
-    }
-}
-
-/// Windows PowerShell 5.1 serializes its error stream as CLIXML when stdio is
-/// redirected. Extract the human-readable <S S="Error"> payloads.
-fn decode_clixml(s: &str) -> Option<String> {
-    if !s.contains("#< CLIXML") {
-        return None;
-    }
-    let mut messages = Vec::new();
-    let mut rest = s;
-    while let Some(i) = rest.find("<S S=\"Error\">") {
-        rest = &rest[i + 13..];
-        let Some(j) = rest.find("</S>") else { break };
-        let decoded = rest[..j]
-            .replace("_x000D__x000A_", "\n")
-            .replace("_x000D_", "")
-            .replace("_x000A_", "\n")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&");
-        messages.push(decoded);
-        rest = &rest[j..];
-    }
-    if messages.is_empty() {
-        None
-    } else {
-        Some(messages.concat())
-    }
-}
+pub use utility_core::is_elevated;
+pub use utility_core::ps::{ps_quote, run_ps, run_ps_quiet};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct HealthReport {
@@ -286,31 +152,6 @@ pub fn spawn_health(tx: Sender<AppEvent>, n: u32) {
     });
 }
 
-pub fn is_elevated() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    unsafe {
-        let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-        let mut len = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elevation as *mut _ as *mut _,
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        );
-        CloseHandle(token);
-        ok != 0 && elevation.TokenIsElevated != 0
-    }
-}
 
 /// Prepare a disk for destructive work: log its exact state, clear
 /// write-protection (Set-Disk, falling back to diskpart), bring it online,

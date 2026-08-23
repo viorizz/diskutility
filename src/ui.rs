@@ -1,8 +1,9 @@
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
+use utility_core::ui::{draw_footer as core_footer, draw_header as core_header, modal_block, spinner, HeaderStatus, Hint, Theme};
 
 use crate::app::{pause_options, schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
 use crate::config::Schedule;
@@ -10,17 +11,17 @@ use crate::jobs;
 use crate::disks::{fit, human, Disk};
 use crate::ops::PRESETS;
 
-const ACCENT: Color = Color::Rgb(222, 119, 87);
-const ACCENT_SOFT: Color = Color::Rgb(245, 173, 130);
-const BORDER: Color = Color::Rgb(82, 82, 96);
-const DIM: Color = Color::Rgb(132, 134, 148);
-const TEXT: Color = Color::Rgb(226, 224, 218);
-const OK_C: Color = Color::Rgb(139, 202, 128);
-const ERR_C: Color = Color::Rgb(238, 105, 105);
-const WARN_C: Color = Color::Rgb(238, 189, 94);
-const SEL_BG: Color = Color::Rgb(58, 42, 36);
-
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// The shared *Utility look, DiskUtility's accent.
+pub const THEME: Theme = Theme::DISK;
+const ACCENT: Color = THEME.accent;
+const ACCENT_SOFT: Color = THEME.accent_soft;
+const DIM: Color = THEME.dim;
+const TEXT: Color = THEME.text;
+const OK_C: Color = THEME.ok;
+const ERR_C: Color = THEME.err;
+const WARN_C: Color = THEME.warn;
+const SEL_BG: Color = THEME.sel_bg;
+const BORDER: Color = THEME.border;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -67,56 +68,22 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn bordered(title: Line<'static>) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(BORDER))
-        .title(title)
+    THEME.bordered(title)
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let border = if app.unlocked { ERR_C } else { ACCENT };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(border));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let left = Line::from(vec![
-        Span::styled(" ✦ ", Style::new().fg(ACCENT).bold()),
-        Span::styled("Disk Utility", Style::new().fg(TEXT).bold()),
-        Span::styled(
-            format!(
-                "  v{} · build {}",
-                env!("CARGO_PKG_VERSION"),
-                crate::build_stamp()
-            ),
-            Style::new().fg(DIM),
-        ),
-        Span::styled("   format · erase · write images", Style::new().fg(DIM).italic()),
-    ]);
-    f.render_widget(Paragraph::new(left), inner);
-
-    let mut spans: Vec<Span> = Vec::new();
-    if let Some(tag) = &app.update {
-        spans.push(Span::styled(
-            format!("⬆ {tag} available — Shift+U to update"),
-            Style::new().fg(ACCENT_SOFT),
-        ));
-        spans.push(Span::styled(" · ", Style::new().fg(DIM)));
-    }
+    let mut badges = Vec::new();
     if app.unlocked {
-        spans.push(Span::styled("⛨ PROTECTIONS OFF", Style::new().fg(ERR_C).bold()));
-        spans.push(Span::styled(" · ", Style::new().fg(DIM)));
+        badges.push(Span::styled("⛨ PROTECTIONS OFF", Style::new().fg(ERR_C).bold()));
     }
-    if app.elevated {
-        spans.push(Span::styled("● administrator ", Style::new().fg(OK_C)));
-    } else {
-        spans.push(Span::styled("⚠ not elevated — read-only ", Style::new().fg(WARN_C)));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
-        inner,
-    );
+    let status = HeaderStatus {
+        update_available: app.update.clone(),
+        badges,
+        alert: app.unlocked,
+        show_elevation: true,
+        elevated: app.elevated,
+    };
+    core_header(f, area, &THEME, &crate::APP, &status);
 }
 
 fn draw_disk_list(f: &mut Frame, area: Rect, app: &App) {
@@ -124,7 +91,7 @@ fn draw_disk_list(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(" Disks ", Style::new().fg(TEXT).bold()),
             Span::styled(
-                format!("{} scanning… ", SPINNER[app.tick % SPINNER.len()]),
+                format!("{} scanning… ", spinner(app.tick)),
                 Style::new().fg(ACCENT_SOFT),
             ),
         ])
@@ -304,7 +271,7 @@ fn draw_jobs_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(tag, Style::new().fg(WARN_C).bold()),
-            Span::styled(SPINNER[app.tick % SPINNER.len()], Style::new().fg(WARN_C)),
+            Span::styled(spinner(app.tick), Style::new().fg(WARN_C)),
         ])),
         cols[0],
     );
@@ -516,88 +483,30 @@ fn draw_pause_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    if let Some((msg, is_err, _)) = &app.status {
-        let style = if *is_err {
-            Style::new().fg(ERR_C).bold()
-        } else {
-            Style::new().fg(OK_C)
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {msg}"), style))),
-            area,
-        );
-        return;
-    }
-    let key = |k: &'static str| Span::styled(k, Style::new().fg(ACCENT_SOFT).bold());
-    let txt = |t: &'static str| Span::styled(t, Style::new().fg(DIM));
-    let line = Line::from(vec![
-        txt(" "),
-        key("↑↓"),
-        txt(" select · "),
-        key("f"),
-        txt(" format · "),
-        key("e"),
-        txt(" erase · "),
-        key("i"),
-        txt(" write · "),
-        key("s"),
-        txt(" backup · "),
-        key("n"),
-        txt(" backup dir · "),
-        key("d"),
-        txt(" clone · "),
-        key("a"),
-        txt(" auto · "),
-        key("m"),
-        txt(" manage · "),
-        key("b"),
-        txt(" test · "),
-        key("h"),
-        txt(" health · "),
-        key("r"),
-        txt(" rescan · "),
-        key("c"),
-        txt(" log · "),
-        key("u"),
-        txt(if app.unlocked { " re-lock · " } else { " override · " }),
-        key("?"),
-        txt(" help · "),
-        key("q"),
-        txt(" quit"),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    let hints: &[Hint] = &[
+        ("↑↓", "select"),
+        ("f", "format"),
+        ("e", "erase"),
+        ("i", "write"),
+        ("s", "backup"),
+        ("n", "backup dir"),
+        ("d", "clone"),
+        ("a", "auto"),
+        ("m", "manage"),
+        ("b", "test"),
+        ("h", "health"),
+        ("r", "rescan"),
+        ("c", "log"),
+        ("u", if app.unlocked { "re-lock" } else { "override" }),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+    core_footer(f, area, &THEME, app.status.as_ref().map(|(m, e, _)| (m.as_str(), *e)), hints);
 }
 
 // ---------------------------------------------------------------------------
 // Modals
 // ---------------------------------------------------------------------------
-
-fn modal_rect(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width.saturating_sub(2));
-    let h = h.min(area.height.saturating_sub(2));
-    Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    }
-}
-
-fn modal_block(f: &mut Frame, area: Rect, w: u16, h: u16, title: &str, color: Color) -> Rect {
-    let rect = modal_rect(area, w, h);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(color))
-        .title(Line::from(Span::styled(
-            format!(" {title} "),
-            Style::new().fg(color).bold(),
-        )))
-        .padding(Padding::new(2, 2, 1, 1));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    inner
-}
 
 fn draw_presets(f: &mut Frame, area: Rect, idx: usize) {
     let inner = modal_block(f, area, 66, 16, "Format — choose a target", ACCENT);
@@ -992,7 +901,7 @@ fn draw_progress(f: &mut Frame, area: Rect, app: &App, p: &ProgressState) {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!("{} ", SPINNER[app.tick % SPINNER.len()]),
+                        format!("{} ", spinner(app.tick)),
                         Style::new().fg(ACCENT_SOFT).bold(),
                     ),
                     Span::styled(format!("working… {secs}s"), Style::new().fg(TEXT)),
@@ -1072,7 +981,7 @@ fn draw_health(
     let lines: Vec<Line> = match report {
         None => vec![Line::from(vec![
             Span::styled(
-                format!("{} ", SPINNER[app.tick % SPINNER.len()]),
+                format!("{} ", spinner(app.tick)),
                 Style::new().fg(ACCENT_SOFT).bold(),
             ),
             Span::styled("querying drive health…", Style::new().fg(TEXT)),
@@ -1272,7 +1181,7 @@ fn draw_update(
         lines.push(Line::default());
         match done {
             None => lines.push(Line::from(Span::styled(
-                format!("{} working — please wait", SPINNER[app.tick % SPINNER.len()]),
+                format!("{} working — please wait", spinner(app.tick)),
                 Style::new().fg(ACCENT_SOFT),
             ))),
             Some(Ok(m)) => {
@@ -1427,6 +1336,7 @@ mod tests {
     /// percentage, disk, image, detail and the Shift+B hint.
     #[test]
     fn sched_status_bar_renders() {
+        utility_core::init(&crate::APP);
         let mut app = App::new();
         app.jobs = vec![jobs::Job {
             pid: 1,

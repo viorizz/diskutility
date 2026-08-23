@@ -6,44 +6,30 @@ mod bench;
 mod config;
 mod disks;
 mod jobs;
-mod logger;
-mod notify;
 mod ops;
 mod schedule;
 mod ui;
-mod update;
 
-/// Human-readable compile timestamp, baked in by build.rs.
-pub fn build_stamp() -> String {
-    env!("BUILD_EPOCH")
-        .parse::<i64>()
-        .ok()
-        .and_then(|e| chrono::DateTime::from_timestamp(e, 0))
-        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "unknown".into())
-}
+// Shared with the other *Utility tools.
+pub use utility_core::{logger, notify, update};
+
+use utility_core::{cli, AppInfo};
+
+pub static APP: AppInfo = AppInfo {
+    name: "diskutility",
+    display_name: "Disk Utility",
+    repo: "viorizz/diskutility",
+    tagline: "format · erase · write images",
+    version: env!("CARGO_PKG_VERSION"),
+    build_epoch: env!("BUILD_EPOCH"),
+};
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("diskutility v{} (built {})", env!("CARGO_PKG_VERSION"), build_stamp());
-        return Ok(());
+    // `--version`, `--update` and the update-check opt-out.
+    if let Some(code) = cli::handle_common_args(&APP) {
+        std::process::exit(code);
     }
-
-    logger::init(
-        &format!("{} · built {}", env!("CARGO_PKG_VERSION"), build_stamp()),
-        ops::is_elevated(),
-    );
-    update::cleanup();
-
-    if std::env::args().any(|a| a == "--update") {
-        match update::self_update_with(&|step| println!("{step}")) {
-            Ok(msg) => {
-                println!("{msg}");
-                return Ok(());
-            }
-            Err(e) => anyhow::bail!("update failed: {e}"),
-        }
-    }
+    utility_core::init(&APP);
 
     // `diskutility --scheduled-backup` — headless run launched by the
     // Task Scheduler job registered with the `a` key.
@@ -102,21 +88,10 @@ fn main() -> anyhow::Result<()> {
 
     // Opt-in automatic update on launch (Shift+U → a in the TUI). Network
     // access still honours --no-update-check / DISKUTILITY_NO_UPDATE_CHECK.
-    if config::load().auto_update && !app::update_check_opted_out() {
-        println!("diskutility: auto-update is on — checking for a new release…");
-        match update::self_update_with(&|step| println!("  {step}")) {
-            Ok(msg) if update::updated(&msg) => {
-                println!("  {msg}");
-                println!("  restarting…");
-                std::process::exit(update::relaunch().map_err(|e| anyhow::anyhow!(e))?);
-            }
-            Ok(msg) => println!("  {msg}"),
-            Err(e) => println!("  update skipped: {e}"),
-        }
-    }
+    cli::auto_update_on_launch(&APP, config::load().auto_update);
 
     let mut terminal = ratatui::init();
-    let _ = crossterm_set_title();
+    let _ = utility_core::ui::set_terminal_title(&APP);
     let mut app = app::App::new();
     let result = app.run(&mut terminal);
     ratatui::restore();
@@ -125,11 +100,6 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(update::relaunch().map_err(|e| anyhow::anyhow!(e))?);
     }
     result
-}
-
-fn crossterm_set_title() -> std::io::Result<()> {
-    use ratatui::crossterm::{execute, terminal::SetTitle};
-    execute!(std::io::stdout(), SetTitle("Disk Utility"))
 }
 
 fn list_disks() -> anyhow::Result<()> {

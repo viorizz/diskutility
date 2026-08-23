@@ -2,11 +2,7 @@
 //! the preferred backup destination, the automatic-backup schedule, and
 //! whether updates should be installed automatically on launch.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
-
-use crate::logger;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -175,35 +171,14 @@ impl Schedule {
 }
 
 /// `%APPDATA%\diskutility` — config, log and the scheduled-backup status files.
-pub fn dir() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
-    Some(base.join("diskutility"))
-}
-
-fn path() -> Option<PathBuf> {
-    Some(dir()?.join("config.json"))
-}
+pub use utility_core::config::dir;
 
 pub fn load() -> Config {
-    let Some(p) = path() else { return Config::default() };
-    match std::fs::read_to_string(&p) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-            logger::log(format!("config: {} is not valid JSON ({e}) — using defaults", p.display()));
-            Config::default()
-        }),
-        Err(_) => Config::default(),
-    }
+    utility_core::config::load()
 }
 
 pub fn save(cfg: &Config) -> Result<(), String> {
-    let p = path().ok_or("APPDATA is not set — cannot save settings")?;
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    }
-    let text = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&p, text).map_err(|e| format!("cannot write {}: {e}", p.display()))?;
-    logger::log(format!("config saved to {}", p.display()));
-    Ok(())
+    utility_core::config::save(cfg)
 }
 
 #[cfg(test)]

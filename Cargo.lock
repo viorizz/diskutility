@@ -172,14 +172,14 @@ dependencies = [
 
 [[package]]
 name = "diskutility"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
- "base64",
  "chrono",
  "ratatui",
  "serde",
  "serde_json",
+ "utility-core",
  "windows-sys 0.59.0",
 ]
 
@@ -701,6 +701,19 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+
+[[package]]
+name = "utility-core"
+version = "0.1.0"
+source = "git+https://github.com/viorizz/utility-core?tag=v0.1.0#23908b979dde5efd1931f21be380c47180d1f29a"
+dependencies = [
+ "base64",
+ "chrono",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "wasi"

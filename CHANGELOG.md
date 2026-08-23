@@ -6,6 +6,12 @@ body, so **every release must have its section here before the tag is pushed**
 (the workflow fails otherwise). GitHub's auto-generated "Full Changelog"
 comparison link is appended below these notes.
 
+## v0.4.8 — 2026-08-23
+
+### Changed
+- **Built on [utility-core](https://github.com/viorizz/utility-core)** — the shared foundation of the *Utility line. The logger, the SHA-256-verified self-updater, toast notifications, the `%APPDATA%\diskutility\config.json` load/save, the hardened PowerShell runner (absolute `powershell.exe`, pinned `PSModulePath`, CLIXML error decoding), the elevation check, and the header / footer / modal chrome now come from that crate instead of private copies. Behaviour, file locations, log format, the `--version` banner and every keybinding are unchanged; the `DISKUTILITY_NO_UPDATE_CHECK` / `--no-update-check` opt-out still works.
+- Nothing else: no new features in this release, it exists so DiskUtility, AccountUtility and MouseUtility evolve together.
+
 ## v0.4.7 — 2026-08-23
 
 ### Added

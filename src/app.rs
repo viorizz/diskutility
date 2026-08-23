@@ -123,8 +123,7 @@ fn schedule_adjust(s: &mut Schedule, f: SchedField, delta: i32) {
 
 /// True when the startup update check was disabled by flag or env var.
 pub fn update_check_opted_out() -> bool {
-    std::env::args().any(|a| a == "--no-update-check")
-        || std::env::var_os("DISKUTILITY_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
+    utility_core::cli::update_check_opted_out(&crate::APP)
 }
 
 pub enum InputPurpose {
