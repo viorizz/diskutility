@@ -775,52 +775,187 @@ pub fn verify_identity(disk: &Disk) -> Result<(), String> {
 
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 
+/// Suffix of an image that is still being written: `foo.img.partial`. Next to
+/// it, `foo.img.partial.json` records which disk it belongs to so a later run
+/// can pick it up where it left off. Only a finished, flushed image is renamed
+/// to the bare `.img` name, so a `.img` file is always complete.
+pub const PARTIAL_SUFFIX: &str = ".partial";
+
+/// Identity stored in the partial sidecar — must match the disk to resume.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PartialMeta {
+    pub name: String,
+    pub serial: String,
+    pub size: u64,
+}
+
+impl PartialMeta {
+    pub fn of(d: &Disk) -> Self {
+        PartialMeta { name: d.name.clone(), serial: d.serial.clone(), size: d.size }
+    }
+}
+
+/// An interrupted image that can be continued for this disk.
+#[derive(Debug, Clone)]
+pub struct Resumable {
+    /// Final `.img` path (the partial is `path + ".partial"`).
+    pub path: PathBuf,
+    /// Bytes already on disk, rounded down to a whole chunk.
+    pub done: u64,
+}
+
+pub fn partial_path(img: &std::path::Path) -> PathBuf {
+    let mut p = img.as_os_str().to_owned();
+    p.push(PARTIAL_SUFFIX);
+    PathBuf::from(p)
+}
+
+fn sidecar_path(img: &std::path::Path) -> PathBuf {
+    let mut p = partial_path(img).into_os_string();
+    p.push(".json");
+    PathBuf::from(p)
+}
+
+/// Look through `dir` for `*.img.partial` files whose sidecar says they belong
+/// to `disk`; return the one with the most data. The partial's length is
+/// trusted only after rounding down to a chunk boundary — every chunk was
+/// written whole, so a torn last chunk from a hard kill is simply redone.
+pub fn find_resumable(dir: &std::path::Path, disk: &Disk) -> Option<Resumable> {
+    let want = PartialMeta::of(disk);
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<Resumable> = None;
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
+        let Some(img_name) = name.strip_suffix(PARTIAL_SUFFIX) else { continue };
+        if !img_name.ends_with(".img") {
+            continue;
+        }
+        let img = dir.join(img_name);
+        let Ok(meta_text) = std::fs::read_to_string(sidecar_path(&img)) else { continue };
+        let Ok(meta) = serde_json::from_str::<PartialMeta>(&meta_text) else { continue };
+        let same = meta.size == want.size
+            && if want.serial.is_empty() { meta.name == want.name } else { meta.serial == want.serial };
+        if !same {
+            continue;
+        }
+        let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+        let done = (len / CHUNK as u64) * CHUNK as u64;
+        if done > disk.size {
+            continue;
+        }
+        if best.as_ref().is_none_or(|b| done > b.done) {
+            best = Some(Resumable { path: img, done });
+        }
+    }
+    best
+}
+
 /// Read the whole disk through an uncached handle into an image file.
-/// Non-destructive for the disk; a cancelled run deletes the partial file.
+/// Non-destructive for the disk. Data goes to `<path>.partial` and is renamed
+/// to `path` only once fully written and flushed. If the destination folder
+/// already holds a partial image of this same disk, that one is continued
+/// instead (and `path` is ignored); a cancelled run keeps its partial so it
+/// can be resumed.
 pub fn spawn_backup(tx: Sender<AppEvent>, disk: Disk, path: PathBuf, cancel: Arc<AtomicBool>) {
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
-            log(&tx, format!("Backing up disk {} ({}) → {}", disk.number, human(disk.size), path.display()));
+            let dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            let resume = find_resumable(&dir, &disk);
+            let (path, offset) = match &resume {
+                Some(r) => (r.path.clone(), r.done),
+                None => (path, 0),
+            };
+            let partial = partial_path(&path);
+            if let Some(r) = &resume {
+                log(&tx, format!(
+                    "Resuming interrupted image {} — {} of {} already saved, {} to go",
+                    partial.display(),
+                    human(r.done),
+                    human(disk.size),
+                    human(disk.size - r.done)
+                ));
+                log(&tx, "Note: the earlier part reflects the disk as it was then — only safe if the disk has not been written to since.");
+            } else {
+                log(&tx, format!("Backing up disk {} ({}) → {}", disk.number, human(disk.size), path.display()));
+            }
             log(&tx, "Verifying source identity…");
             verify_identity(&disk)?;
             if disk.partitions.iter().any(|p| !p.letter.is_empty()) {
                 log(&tx, "Note: volumes are mounted — this is a live snapshot; close programs writing to the disk for a consistent image.");
             }
             let mut src = crate::bench::open_direct(disk.number, false)?;
-            // create_new: never overwrite; SEQUENTIAL_SCAN keeps a multi-TB
-            // stream from bloating the cache manager
-            let mut out = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
-                .open(&path)
-                .map_err(|e| format!("cannot create image file: {e}"))?;
+            // SEQUENTIAL_SCAN keeps a multi-TB stream from bloating the cache
+            // manager. Fresh: create_new so nothing is ever overwritten.
+            // Resume: open the existing partial and drop any torn tail.
+            let mut out = if resume.is_some() {
+                let f = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+                    .open(&partial)
+                    .map_err(|e| format!("cannot open partial image: {e}"))?;
+                f.set_len(offset).map_err(|e| format!("cannot trim partial image: {e}"))?;
+                f
+            } else {
+                if path.exists() {
+                    return Err(format!("{} already exists — refusing to overwrite a finished image", path.display()));
+                }
+                let f = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+                    .open(&partial)
+                    .map_err(|e| format!("cannot create image file: {e}"))?;
+                let meta = serde_json::to_string(&PartialMeta::of(&disk)).map_err(|e| e.to_string())?;
+                std::fs::write(sidecar_path(&path), meta).map_err(|e| format!("cannot write sidecar: {e}"))?;
+                f
+            };
+            if offset > 0 {
+                src.seek(SeekFrom::Start(offset)).map_err(|e| format!("disk seek failed: {e}"))?;
+                out.seek(SeekFrom::Start(offset)).map_err(|e| format!("image seek failed: {e}"))?;
+            }
             let mut buf = crate::bench::AlignedBuf::new(CHUNK);
             let total = disk.size;
             let start = Instant::now();
             let mut last = Instant::now();
-            let mut done_b = 0u64;
+            let mut done_b = offset;
             while done_b < total {
                 if cancel.load(Ordering::Relaxed) {
+                    let _ = out.sync_all();
                     drop(out);
-                    let _ = std::fs::remove_file(&path);
-                    return Err("cancelled — the partial image file was deleted".into());
+                    return Err(format!(
+                        "cancelled — {} of {} kept in {}; start the same backup again to resume from there",
+                        human(done_b),
+                        human(total),
+                        partial.display()
+                    ));
                 }
                 let want = (total - done_b).min(CHUNK as u64) as usize;
                 src.read_exact(&mut buf.as_mut()[..want])
                     .map_err(|e| format!("disk read failed at {}: {e}", human(done_b)))?;
-                out.write_all(&buf.as_ref()[..want])
-                    .map_err(|e| format!("image write failed at {}: {e} (destination full?)", human(done_b)))?;
+                out.write_all(&buf.as_ref()[..want]).map_err(|e| {
+                    format!(
+                        "image write failed at {}: {e} (destination full?) — {} kept for resume",
+                        human(done_b),
+                        partial.display()
+                    )
+                })?;
                 done_b += want as u64;
                 if last.elapsed() >= Duration::from_millis(250) {
-                    progress_with(&tx, done_b, total, start, "backup");
+                    progress_with_base(&tx, done_b, total, done_b - offset, start, "backup");
                     last = Instant::now();
                 }
             }
             out.sync_all().map_err(|e| format!("flush failed: {e}"))?;
-            progress_with(&tx, total, total, start, "backup");
+            drop(out);
+            std::fs::rename(&partial, &path).map_err(|e| {
+                format!("image written but could not rename {} to its final name: {e}", partial.display())
+            })?;
+            let _ = std::fs::remove_file(sidecar_path(&path));
+            progress_with_base(&tx, total, total, total - offset, start, "backup");
+            let resumed = if offset > 0 { format!(" (resumed from {})", human(offset)) } else { String::new() };
             Ok(format!(
-                "Backed up disk {} to {} ({}) in {}. Restore it onto any disk of at least that size with i (write image).",
+                "Backed up disk {} to {} ({}) in {}{resumed}. Restore it onto any disk of at least that size with i (write image).",
                 disk.number,
                 path.display(),
                 human(total),
@@ -992,8 +1127,22 @@ fn progress(tx: &Sender<AppEvent>, done_bytes: u64, total: u64, start: Instant) 
 }
 
 pub fn progress_with(tx: &Sender<AppEvent>, done_bytes: u64, total: u64, start: Instant, phase: &str) {
+    progress_with_base(tx, done_bytes, total, done_bytes, start, phase)
+}
+
+/// Like `progress_with`, but speed/ETA are computed from `session_bytes` —
+/// the bytes moved since `start` — so a resumed job reports its real rate
+/// instead of counting the data a previous run already saved.
+pub fn progress_with_base(
+    tx: &Sender<AppEvent>,
+    done_bytes: u64,
+    total: u64,
+    session_bytes: u64,
+    start: Instant,
+    phase: &str,
+) {
     let secs = start.elapsed().as_secs_f64().max(0.001);
-    let speed = done_bytes as f64 / secs;
+    let speed = session_bytes as f64 / secs;
     let eta = (total.saturating_sub(done_bytes)) as f64 / speed.max(1.0);
     let prefix = if phase.is_empty() { String::new() } else { format!("{phase}: ") };
     let detail = format!(
@@ -1133,5 +1282,57 @@ pub fn free_drive_letters() -> Vec<char> {
     match run_ps_quiet(script) {
         Ok(out) => out.trim().chars().filter(|c| c.is_ascii_uppercase()).collect(),
         Err(_) => ('D'..='Z').collect(),
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn disk(serial: &str, size: u64) -> Disk {
+        Disk { name: "WD BLACK".into(), serial: serial.into(), size, ..Default::default() }
+    }
+
+    fn plant(dir: &std::path::Path, img: &str, meta: &PartialMeta, len: u64) {
+        let f = File::create(partial_path(&dir.join(img))).unwrap();
+        f.set_len(len).unwrap();
+        std::fs::write(sidecar_path(&dir.join(img)), serde_json::to_string(meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn partial_and_sidecar_names() {
+        let img = PathBuf::from(r"Z:\b\auto-x.img");
+        assert_eq!(partial_path(&img), PathBuf::from(r"Z:\b\auto-x.img.partial"));
+        assert_eq!(sidecar_path(&img), PathBuf::from(r"Z:\b\auto-x.img.partial.json"));
+    }
+
+    #[test]
+    fn find_resumable_matches_identity_and_rounds_to_chunks() {
+        let dir = std::env::temp_dir().join(format!("du-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = disk("S1", 100 * CHUNK as u64);
+        // nothing yet
+        assert!(find_resumable(&dir, &d).is_none());
+        // 9 chunks + a torn tail → 9 whole chunks
+        plant(&dir, "a.img", &PartialMeta::of(&d), 9 * CHUNK as u64 + 12345);
+        let r = find_resumable(&dir, &d).unwrap();
+        assert_eq!(r.done, 9 * CHUNK as u64);
+        assert_eq!(r.path, dir.join("a.img"));
+        // a bigger partial of the same disk wins
+        plant(&dir, "b.img", &PartialMeta::of(&d), 20 * CHUNK as u64);
+        assert_eq!(find_resumable(&dir, &d).unwrap().path, dir.join("b.img"));
+        // other serial / other size: not ours
+        plant(&dir, "c.img", &PartialMeta::of(&disk("S2", d.size)), 50 * CHUNK as u64);
+        plant(&dir, "d.img", &PartialMeta::of(&disk("S1", d.size + 1)), 60 * CHUNK as u64);
+        assert_eq!(find_resumable(&dir, &d).unwrap().path, dir.join("b.img"));
+        // no sidecar → ignored
+        File::create(partial_path(&dir.join("e.img"))).unwrap().set_len(90 * CHUNK as u64).unwrap();
+        assert_eq!(find_resumable(&dir, &d).unwrap().path, dir.join("b.img"));
+        // unnamed-serial disks fall back to the name
+        let anon = Disk { name: "NoSerial".into(), serial: String::new(), size: 10, ..Default::default() };
+        plant(&dir, "f.img", &PartialMeta::of(&anon), 0);
+        assert_eq!(find_resumable(&dir, &anon).unwrap().path, dir.join("f.img"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::logger;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Folder that backup images default to. Stored as typed by the user
     /// (after mapped-drive → UNC resolution, see `App::validate_backup_dir`).
@@ -20,6 +20,20 @@ pub struct Config {
     /// Automatic backup registered in Windows Task Scheduler (`a` key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<Schedule>,
+    /// Show a Windows toast when a scheduled backup finishes or fails.
+    /// Defaults to on; set `"notify": false` in config.json to silence it.
+    #[serde(default = "yes", skip_serializing_if = "Clone::clone")]
+    pub notify: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { backup_dir: None, auto_update: false, schedule: None, notify: true }
+    }
 }
 
 /// How often the scheduled backup runs. Mirrors `schtasks /SC`.
@@ -78,7 +92,15 @@ pub struct Schedule {
     /// Images to keep for this schedule; older ones are deleted after a
     /// successful backup. 0 = keep everything.
     pub keep: u32,
+    /// Unix seconds until which scheduled runs are skipped; `u64::MAX` =
+    /// paused until resumed by hand. The task stays registered — the runner
+    /// itself checks this and exits quietly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_until: Option<u64>,
 }
+
+/// Marker value for "paused until I resume it".
+pub const PAUSED_INDEFINITELY: u64 = u64::MAX;
 
 impl Default for Schedule {
     fn default() -> Self {
@@ -95,6 +117,7 @@ impl Default for Schedule {
             day: 1,
             month: 1,
             keep: 3,
+            paused_until: None,
         }
     }
 }
@@ -106,6 +129,33 @@ pub const MONTHS: [&str; 12] = [
 ];
 
 impl Schedule {
+    pub fn is_paused(&self, now: u64) -> bool {
+        self.paused_until.is_some_and(|t| t > now)
+    }
+
+    /// "paused until 18:30", "paused until Tue 08:00", "paused until resumed"
+    /// — or None when active. An expired pause reads as active.
+    pub fn pause_text(&self, now: u64) -> Option<String> {
+        let t = self.paused_until?;
+        if t <= now {
+            return None;
+        }
+        if t == PAUSED_INDEFINITELY {
+            return Some("paused until you resume it".into());
+        }
+        let when = chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|d| d.with_timezone(&chrono::Local))
+            .map(|d| {
+                if t - now < 20 * 3600 {
+                    d.format("%H:%M").to_string()
+                } else {
+                    d.format("%a %d %b %H:%M").to_string()
+                }
+            })
+            .unwrap_or_default();
+        Some(format!("paused until {when}"))
+    }
+
     /// Human summary: "daily at 03:00", "weekly on Sunday at 03:00", …
     pub fn describe(&self) -> String {
         let at = format!("{:02}:{:02}", self.hour, self.minute);
@@ -124,9 +174,14 @@ impl Schedule {
     }
 }
 
-fn path() -> Option<PathBuf> {
+/// `%APPDATA%\diskutility` — config, log and the scheduled-backup status files.
+pub fn dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
-    Some(base.join("diskutility").join("config.json"))
+    Some(base.join("diskutility"))
+}
+
+fn path() -> Option<PathBuf> {
+    Some(dir()?.join("config.json"))
 }
 
 pub fn load() -> Config {
@@ -149,4 +204,37 @@ pub fn save(cfg: &Config) -> Result<(), String> {
     std::fs::write(&p, text).map_err(|e| format!("cannot write {}: {e}", p.display()))?;
     logger::log(format!("config saved to {}", p.display()));
     Ok(())
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    #[test]
+    fn pause_semantics_and_serde() {
+        let mut s = Schedule::default();
+        let now = 1_000_000;
+        assert!(!s.is_paused(now));
+        assert_eq!(s.pause_text(now), None);
+        // timed pause, still in the future
+        s.paused_until = Some(now + 3600);
+        assert!(s.is_paused(now));
+        assert!(s.pause_text(now).unwrap().starts_with("paused until "));
+        // expired pause reads as active
+        assert!(!s.is_paused(now + 3600));
+        assert_eq!(s.pause_text(now + 3601), None);
+        // indefinite
+        s.paused_until = Some(PAUSED_INDEFINITELY);
+        assert!(s.is_paused(u64::MAX - 1));
+        assert_eq!(s.pause_text(now).as_deref(), Some("paused until you resume it"));
+        // round-trips, and is omitted from JSON when unset
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Schedule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.paused_until, Some(PAUSED_INDEFINITELY));
+        s.paused_until = None;
+        assert!(!serde_json::to_string(&s).unwrap().contains("paused_until"));
+        // old config.json without the field still loads
+        let old: Schedule = serde_json::from_str(&json.replace(",\"paused_until\":18446744073709551615", "")).unwrap();
+        assert_eq!(old.paused_until, None);
+    }
 }

@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::DefaultTerminal;
 
 use crate::config::{self, Config, Frequency, Schedule, MONTHS, WEEKDAYS};
+use crate::jobs;
 use crate::schedule;
 use crate::disks::{self, Disk};
 use crate::logger;
@@ -266,6 +267,32 @@ pub enum Modal {
     Schedule { s: Schedule, field: usize, installed: bool },
     /// `m`: quick non-destructive actions for the selected disk.
     ManageMenu { idx: usize },
+    /// Shift+B / Shift+X: backups in progress, the schedule, resumable partials.
+    Backups { idx: usize },
+    /// Confirm stopping the backup owned by process `pid`.
+    StopJob { pid: u32 },
+    /// A backup is already running elsewhere; really start another one?
+    ConfirmConcurrent { path: PathBuf },
+    /// `p`: pause / resume the scheduled backup. `from_editor` = reopen the
+    /// schedule editor afterwards instead of the Backups panel.
+    PauseMenu { idx: usize, from_editor: bool },
+}
+
+/// Rows of the pause menu: label + duration in seconds (0 = resume,
+/// `PAUSED_INDEFINITELY` = until resumed).
+pub fn pause_options(paused: bool) -> Vec<(&'static str, u64)> {
+    let mut v = Vec::new();
+    if paused {
+        v.push(("Resume scheduled backups now", 0));
+    }
+    v.extend([
+        ("Pause for 1 hour", 3600),
+        ("Pause for 6 hours", 6 * 3600),
+        ("Pause for 24 hours", 24 * 3600),
+        ("Pause for 7 days", 7 * 24 * 3600),
+        ("Pause until I resume it", config::PAUSED_INDEFINITELY),
+    ]);
+    v
 }
 
 pub struct App {
@@ -287,6 +314,12 @@ pub struct App {
     quit: bool,
     /// Set after a successful in-app update: main relaunches the new exe.
     restart: bool,
+    /// Backups running in OTHER processes right now (polled from the jobs
+    /// directory); drives the status bar, the Backups panel and the warning
+    /// in the backup menu.
+    pub jobs: Vec<jobs::Job>,
+    /// Our own interactive backup, published for other processes.
+    publisher: Option<jobs::Publisher>,
 }
 
 impl App {
@@ -312,6 +345,8 @@ impl App {
             rx,
             quit: false,
             restart: false,
+            jobs: Vec::new(),
+            publisher: None,
         }
     }
 
@@ -335,6 +370,29 @@ impl App {
         }
         while !self.quit {
             self.tick = self.tick.wrapping_add(1);
+            // ~every 0.8 s: which backups are running in other processes?
+            if self.tick % 10 == 1 {
+                let now = jobs::others();
+                for gone in self.jobs.iter().filter(|j| !now.iter().any(|n| n.pid == j.pid)) {
+                    self.status = Some((
+                        format!("{} backup of {} finished — see diskutility.log for the result", gone.kind.label(), gone.disk),
+                        false,
+                        Instant::now(),
+                    ));
+                }
+                self.jobs = now;
+                // our own backup may have been asked to stop from another window
+                if let (Some(pubr), Modal::Progress(p)) = (&mut self.publisher, &self.modal) {
+                    if p.done.is_none() && pubr.cancel_requested() && !p.cancel.load(Ordering::Relaxed) {
+                        p.cancel.store(true, Ordering::Relaxed);
+                        pubr.mark_cancelling();
+                        logger::log("backup: stop requested from another diskutility window");
+                    }
+                }
+            }
+            if let Some(pubr) = &mut self.publisher {
+                pubr.heartbeat();
+            }
             if let Some((_, _, t)) = &self.status {
                 if t.elapsed() > Duration::from_secs(5) {
                     self.status = None;
@@ -379,6 +437,9 @@ impl App {
                         }
                         OpEvent::Progress(frac, detail) => {
                             p.pct = Some(frac);
+                            if let Some(pubr) = &mut self.publisher {
+                                pubr.update(frac, &detail);
+                            }
                             p.detail = detail;
                         }
                         OpEvent::Sample(v) => {
@@ -393,6 +454,7 @@ impl App {
                                 Err(m) => logger::log(format!("op FAILED: {m}")),
                             }
                             p.done = Some(r);
+                            self.publisher = None;
                         }
                     }
                 }
@@ -790,8 +852,73 @@ impl App {
             cancel: cancel.clone(),
             cancellable: true,
         };
+        let dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let (image, frac) = match ops::find_resumable(&dir, &disk) {
+            Some(r) => (r.path.clone(), r.done as f64 / disk.size.max(1) as f64),
+            None => (path.clone(), 0.0),
+        };
+        self.publisher = Some(jobs::Publisher::start(jobs::Kind::Interactive, &disk, &image, frac));
         ops::spawn_backup(self.tx.clone(), disk, path, cancel);
         self.modal = Modal::Progress(progress);
+    }
+
+    pub fn schedule_paused(&self) -> bool {
+        self.config.schedule.as_ref().is_some_and(|s| s.is_paused(jobs::now_unix()))
+    }
+
+    /// Pause the scheduled backup for `secs` (0 = resume, `PAUSED_INDEFINITELY`
+    /// = until resumed) and save. The task stays registered; the runner
+    /// checks the pause itself, so no elevation is needed here.
+    fn set_pause(&mut self, secs: u64) {
+        let Some(sc) = self.config.schedule.as_mut() else {
+            self.error("no scheduled backup configured");
+            return;
+        };
+        let now = jobs::now_unix();
+        sc.paused_until = match secs {
+            0 => None,
+            config::PAUSED_INDEFINITELY => Some(config::PAUSED_INDEFINITELY),
+            n => Some(now + n),
+        };
+        let text = sc.pause_text(now);
+        match config::save(&self.config) {
+            Ok(()) => match text {
+                Some(t) => {
+                    logger::log(format!("scheduled backup {t}"));
+                    self.info(format!("scheduled backups {t} — a running backup is not affected"));
+                }
+                None => {
+                    logger::log("scheduled backup resumed");
+                    self.info("scheduled backups resumed — the next trigger will run");
+                }
+            },
+            Err(e) => self.error(format!("could not save settings: {e}")),
+        }
+    }
+
+    /// Interrupted images of the selected disk (or of the scheduled disk) that
+    /// the next backup would continue — shown in the Backups panel.
+    pub fn resumable_partials(&self) -> Vec<(String, u64, u64)> {
+        let mut dirs: Vec<String> = Vec::new();
+        if let Some(d) = &self.config.backup_dir {
+            dirs.push(d.clone());
+        }
+        if let Some(s) = &self.config.schedule {
+            if !dirs.contains(&s.dest_dir) {
+                dirs.push(s.dest_dir.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for d in dirs {
+            for disk in &self.disks {
+                if let Some(r) = ops::find_resumable(std::path::Path::new(&d), disk) {
+                    out.push((r.path.display().to_string(), r.done, disk.size));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -954,6 +1081,7 @@ impl App {
                         }
                     },
                     InputPurpose::BackupPath => match self.validate_backup(&buf) {
+                        Ok(path) if !self.jobs.is_empty() => self.modal = Modal::ConfirmConcurrent { path },
                         Ok(path) => self.start_backup(path),
                         Err(e) => {
                             self.error(e);
@@ -1038,6 +1166,87 @@ impl App {
                     self.modal = Modal::Confirm { action, buf };
                 }
                 _ => self.modal = Modal::Confirm { action, buf },
+            },
+            Modal::StopJob { pid } => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => match jobs::request_cancel(pid) {
+                    Ok(()) => {
+                        self.info("stop requested — the backup will abort; its partial image is kept so the next run resumes it");
+                        self.modal = Modal::Backups { idx: 0 };
+                    }
+                    Err(e) => self.error(e),
+                },
+                _ => self.modal = Modal::Backups { idx: 0 },
+            },
+            Modal::Backups { mut idx } => {
+                let n = self.jobs.len();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('B') => {}
+                    KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                        idx = (idx + n - 1) % n;
+                        self.modal = Modal::Backups { idx };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                        idx = (idx + 1) % n;
+                        self.modal = Modal::Backups { idx };
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Delete => match self.jobs.get(idx.min(n.saturating_sub(1))) {
+                        Some(j) => self.modal = Modal::StopJob { pid: j.pid },
+                        None => {
+                            self.info("no backup is running");
+                            self.modal = Modal::Backups { idx };
+                        }
+                    },
+                    KeyCode::Char('r') => {
+                        self.jobs = jobs::others();
+                        self.modal = Modal::Backups { idx: idx.min(self.jobs.len().saturating_sub(1)) };
+                    }
+                    KeyCode::Char('p') => {
+                        if self.config.schedule.is_some() {
+                            self.modal = Modal::PauseMenu { idx: 0, from_editor: false };
+                        } else {
+                            self.info("no scheduled backup to pause — press a on a disk to create one");
+                            self.modal = Modal::Backups { idx };
+                        }
+                    }
+                    _ => self.modal = Modal::Backups { idx },
+                }
+            }
+            Modal::PauseMenu { mut idx, from_editor } => {
+                let paused = self.schedule_paused();
+                let opts = pause_options(paused);
+                let n = opts.len();
+                let back = |app: &mut App| {
+                    if from_editor {
+                        app.open_schedule();
+                    } else {
+                        app.modal = Modal::Backups { idx: 0 };
+                    }
+                };
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => back(self),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        idx = (idx + n - 1) % n;
+                        self.modal = Modal::PauseMenu { idx, from_editor };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        idx = (idx + 1) % n;
+                        self.modal = Modal::PauseMenu { idx, from_editor };
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        let (_, secs) = opts[idx.min(n - 1)];
+                        self.set_pause(secs);
+                        back(self);
+                    }
+                    _ => self.modal = Modal::PauseMenu { idx, from_editor },
+                }
+            }
+            Modal::ConfirmConcurrent { path } => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    logger::log("backup: user chose to start a backup while another one is running");
+                    self.start_backup(path);
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => self.modal = Modal::Backups { idx: 0 },
+                _ => self.info("backup not started"),
             },
             Modal::ManageMenu { mut idx } => {
                 let items = self.manage_items();
@@ -1124,6 +1333,7 @@ impl App {
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
             KeyCode::Char('U') => self.modal = Modal::Update { steps: Vec::new(), done: None },
+            KeyCode::Char('B') | KeyCode::Char('X') => self.modal = Modal::Backups { idx: 0 },
             KeyCode::Char('a') => self.open_schedule(),
             KeyCode::Char('m') => {
                 if !self.elevated {
@@ -1367,6 +1577,14 @@ impl App {
             KeyCode::Char('n') => {
                 let buf = self.config.backup_dir.clone().unwrap_or_default();
                 self.modal = Modal::Input { purpose: InputPurpose::BackupDir, buf };
+            }
+            KeyCode::Char('p') => {
+                if self.config.schedule.is_some() {
+                    self.modal = Modal::PauseMenu { idx: 0, from_editor: true };
+                } else {
+                    self.error("save the schedule first (Enter) — then p pauses it");
+                    self.modal = Modal::Schedule { s, field, installed };
+                }
             }
             KeyCode::Char('x') | KeyCode::Delete => {
                 let r = if installed { schedule::remove() } else { Ok(()) };

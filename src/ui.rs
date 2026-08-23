@@ -4,8 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
-use crate::app::{schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
+use crate::app::{pause_options, schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
 use crate::config::Schedule;
+use crate::jobs;
 use crate::disks::{fit, human, Disk};
 use crate::ops::PRESETS;
 
@@ -23,9 +24,12 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    // An extra row above the footer appears while a scheduled backup runs.
+    let bar_h = if app.jobs.is_empty() { 0 } else { 1 };
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(6),
+        Constraint::Length(bar_h),
         Constraint::Length(1),
     ])
     .split(area);
@@ -35,7 +39,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     let cols = Layout::horizontal([Constraint::Length(46), Constraint::Min(30)]).split(rows[1]);
     draw_disk_list(f, cols[0], app);
     draw_details(f, cols[1], app);
-    draw_footer(f, rows[2], app);
+    if !app.jobs.is_empty() {
+        draw_jobs_bar(f, rows[2], app);
+    }
+    draw_footer(f, rows[3], app);
 
     match &app.modal {
         Modal::None => {}
@@ -50,8 +57,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
         Modal::Progress(p) => draw_progress(f, area, app, p),
         Modal::Update { steps, done } => draw_update(f, area, app, steps, done.as_ref()),
-        Modal::Schedule { s, field, installed } => draw_schedule(f, area, s, *field, *installed),
+        Modal::Schedule { s, field, installed } => draw_schedule(f, area, app, s, *field, *installed),
         Modal::ManageMenu { idx } => draw_manage_menu(f, area, app, *idx),
+        Modal::Backups { idx } => draw_backups(f, area, app, *idx),
+        Modal::StopJob { pid } => draw_stop_job(f, area, app, *pid),
+        Modal::ConfirmConcurrent { path } => draw_confirm_concurrent(f, area, app, path),
+        Modal::PauseMenu { idx, .. } => draw_pause_menu(f, area, app, *idx),
     }
 }
 
@@ -276,6 +287,234 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// One-line status bar: progress of backups running in other processes
+/// (a Task Scheduler run, or another diskutility window).
+fn draw_jobs_bar(f: &mut Frame, area: Rect, app: &App) {
+    let Some(j) = app.jobs.first() else { return };
+    if area.height == 0 {
+        return;
+    }
+    let pct = (j.frac.clamp(0.0, 1.0) * 100.0) as u16;
+    let cols = Layout::horizontal([Constraint::Length(22), Constraint::Min(20), Constraint::Length(24)]).split(area);
+    let tag = if app.jobs.len() > 1 {
+        format!(" ⏱ {} backups ", app.jobs.len())
+    } else {
+        format!(" ⏱ {} backup ", j.kind.label())
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(tag, Style::new().fg(WARN_C).bold()),
+            Span::styled(SPINNER[app.tick % SPINNER.len()], Style::new().fg(WARN_C)),
+        ])),
+        cols[0],
+    );
+    let label = format!("{pct}%  {} → {}  ·  {}", j.disk, j.image, j.detail);
+    f.render_widget(
+        Gauge::default()
+            .gauge_style(Style::new().fg(if j.cancelling() { ERR_C } else { ACCENT }).bg(BORDER))
+            .ratio(j.frac.clamp(0.0, 1.0))
+            .label(Span::styled(label, Style::new().fg(TEXT).bold())),
+        cols[1],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Shift+B", Style::new().fg(ACCENT_SOFT).bold()),
+            Span::styled(" backups panel", Style::new().fg(DIM)),
+        ])),
+        cols[2],
+    );
+}
+
+fn fmt_elapsed(secs: u64) -> String {
+    crate::ops::fmt_secs_pub(secs as f64)
+}
+
+/// Shift+B: everything about backups in flight — running jobs (with a gauge
+/// each), the registered schedule, and interrupted images that the next
+/// backup would resume.
+fn draw_backups(f: &mut Frame, area: Rect, app: &App, idx: usize) {
+    let partials = app.resumable_partials();
+    let h = (15 + app.jobs.len() as u16 * 4 + partials.len().max(1) as u16).min(area.height.saturating_sub(2));
+    let inner = modal_block(f, area, 90, h, "Backups", ACCENT);
+    let dim = |t: String| Line::from(Span::styled(t, Style::new().fg(DIM)));
+    let head = |t: &'static str| Line::from(Span::styled(t, Style::new().fg(ACCENT_SOFT).bold()));
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(head("Running now"));
+    if app.jobs.is_empty() {
+        lines.push(dim("  none — nothing is being backed up in the background".into()));
+    }
+    let mut y_gauges: Vec<(u16, &jobs::Job)> = Vec::new();
+    for (i, j) in app.jobs.iter().enumerate() {
+        let sel = i == idx;
+        let style = if sel { Style::new().fg(ACCENT_SOFT).bg(SEL_BG).bold() } else { Style::new().fg(TEXT).bold() };
+        let started = chrono::DateTime::from_timestamp(j.started as i64, 0)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(if sel { "▸ " } else { "  " }, style),
+            Span::styled(format!("{:<10}", j.kind.label()), style),
+            Span::styled(format!("{}  →  {}", j.disk, j.image), Style::new().fg(TEXT)),
+        ]));
+        lines.push(dim(format!(
+            "             pid {} · started {started} · running {} · {}",
+            j.pid,
+            fmt_elapsed(j.elapsed_secs()),
+            j.detail
+        )));
+        y_gauges.push((lines.len() as u16, j));
+        lines.push(Line::default()); // gauge row, drawn below
+        lines.push(Line::default());
+    }
+
+    lines.push(head("Schedule"));
+    match &app.config.schedule {
+        Some(sc) => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", sc.disk_name), Style::new().fg(TEXT).bold()),
+                Span::styled(format!("{} → {}", sc.describe(), sc.dest_dir), Style::new().fg(TEXT)),
+            ]));
+            lines.push(dim(format!(
+                "  keep {} · task {}",
+                if sc.keep == 0 { "all".to_string() } else { sc.keep.to_string() },
+                if crate::schedule::is_installed() { "registered" } else { "NOT registered (a to fix)" }
+            )));
+            match sc.pause_text(jobs::now_unix()) {
+                Some(t) => lines.push(Line::from(Span::styled(
+                    format!("  ⏸ {t} — scheduled runs are skipped (p to resume)"),
+                    Style::new().fg(WARN_C).bold(),
+                ))),
+                None => lines.push(dim("  active (p to pause for a while or until further notice)".into())),
+            }
+        }
+        None => lines.push(dim("  none — press a on a disk to schedule automatic backups".into())),
+    }
+    lines.push(Line::default());
+
+    lines.push(head("Interrupted images (resumed by the next backup of that disk)"));
+    if partials.is_empty() {
+        lines.push(dim("  none".into()));
+    }
+    for (path, done, size) in &partials {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {path}"), Style::new().fg(TEXT)),
+            Span::styled(
+                format!("   {} of {} ({}%)", human(*done), human(*size), done * 100 / (*size).max(1)),
+                Style::new().fg(WARN_C),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(dim("↑↓ select a running backup · x stop it (partial image kept) · p pause/resume schedule · r refresh · Esc close".into()));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    for (y, j) in y_gauges {
+        if y >= inner.height {
+            break;
+        }
+        let r = Rect { x: inner.x + 13, y: inner.y + y, width: inner.width.saturating_sub(14), height: 1 };
+        f.render_widget(
+            Gauge::default()
+                .gauge_style(Style::new().fg(if j.cancelling() { ERR_C } else { ACCENT }).bg(BORDER))
+                .ratio(j.frac.clamp(0.0, 1.0))
+                .label(Span::styled(format!("{:.0}%", j.frac * 100.0), Style::new().fg(TEXT).bold())),
+            r,
+        );
+    }
+}
+
+fn draw_stop_job(f: &mut Frame, area: Rect, app: &App, pid: u32) {
+    let inner = modal_block(f, area, 70, 10, "Stop this backup?", WARN_C);
+    let t = |x: String| Line::from(Span::styled(x, Style::new().fg(TEXT)));
+    let (kind, disk, image) = app
+        .jobs
+        .iter()
+        .find(|j| j.pid == pid)
+        .map(|j| (j.kind.label().to_string(), j.disk.clone(), j.image.clone()))
+        .unwrap_or_default();
+    let lines = vec![
+        t(format!("Running: {kind} backup of {disk}")),
+        t(format!("Image:   {image}")),
+        Line::default(),
+        t("The process will abort within a few seconds. The partial image is kept".into()),
+        t("and the next backup of this disk resumes from it. The disk itself is only read.".into()),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("y", Style::new().fg(ERR_C).bold()),
+            Span::styled(" stop the backup   ", Style::new().fg(TEXT)),
+            Span::styled("Esc / n", Style::new().fg(ACCENT_SOFT).bold()),
+            Span::styled(" let it run", Style::new().fg(TEXT)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_confirm_concurrent(f: &mut Frame, area: Rect, app: &App, path: &std::path::Path) {
+    let inner = modal_block(f, area, 76, 12 + app.jobs.len() as u16, "⚠ A backup is already running", WARN_C);
+    let t = |x: String| Line::from(Span::styled(x, Style::new().fg(TEXT)));
+    let mut lines = vec![];
+    for j in &app.jobs {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} · ", j.kind.label()), Style::new().fg(WARN_C).bold()),
+            Span::styled(format!("{} → {} · {:.0}%", j.disk, j.image, j.frac * 100.0), Style::new().fg(TEXT)),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(t(format!("You are about to start another one: {}", path.display())));
+    lines.push(Line::default());
+    lines.push(t("Two backups at once read the disk(s) concurrently and share the destination's".into()));
+    lines.push(t("bandwidth — each will take roughly twice as long. If this is the same disk and".into()));
+    lines.push(t("folder, it is better to let the running one finish (it can be stopped and".into()));
+    lines.push(t("resumed later from the Backups panel).".into()));
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("y", Style::new().fg(ERR_C).bold()),
+        Span::styled(" start anyway   ", Style::new().fg(TEXT)),
+        Span::styled("b", Style::new().fg(ACCENT_SOFT).bold()),
+        Span::styled(" open the Backups panel   ", Style::new().fg(TEXT)),
+        Span::styled("Esc / n", Style::new().fg(ACCENT_SOFT).bold()),
+        Span::styled(" don't start", Style::new().fg(TEXT)),
+    ]));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_pause_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
+    let paused = app.schedule_paused();
+    let opts = pause_options(paused);
+    let inner = modal_block(f, area, 66, 9 + opts.len() as u16, "Pause scheduled backups", WARN_C);
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(sc) = &app.config.schedule {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", sc.disk_name), Style::new().fg(TEXT).bold()),
+            Span::styled(sc.describe(), Style::new().fg(TEXT)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            match sc.pause_text(jobs::now_unix()) {
+                Some(t) => format!("currently {t}"),
+                None => "currently active".into(),
+            },
+            Style::new().fg(if paused { WARN_C } else { OK_C }),
+        )));
+        lines.push(Line::default());
+    }
+    for (i, (label, _)) in opts.iter().enumerate() {
+        let sel = i == idx;
+        let style = if sel { Style::new().fg(ACCENT_SOFT).bg(SEL_BG).bold() } else { Style::new().fg(TEXT) };
+        lines.push(Line::from(Span::styled(format!("{}{label}", if sel { "▸ " } else { "  " }), style)));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "While paused the task stays registered but every run exits without doing anything.",
+        Style::new().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "A timed pause lifts itself; a backup already running is not affected.",
+        Style::new().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled("Enter choose · Esc back", Style::new().fg(DIM))));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if let Some((msg, is_err, _)) = &app.status {
         let style = if *is_err {
@@ -454,9 +693,23 @@ fn draw_erase_menu(f: &mut Frame, area: Rect, idx: usize) {
 fn draw_backup_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
     let choices = app.backup_choices();
     let disk = app.selected_disk();
-    let h = 9 + choices.len() as u16;
+    let warn_h = if app.jobs.is_empty() { 0 } else { 2 + app.jobs.len() as u16 };
+    let h = 9 + choices.len() as u16 + warn_h;
     let inner = modal_block(f, area, 78, h, "Backup — where should the image go?", ACCENT);
     let mut lines: Vec<Line> = Vec::new();
+    if !app.jobs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "⚠ A backup is already running — starting another will ask you to confirm:",
+            Style::new().fg(WARN_C).bold(),
+        )));
+        for j in &app.jobs {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {} · ", j.kind.label()), Style::new().fg(WARN_C)),
+                Span::styled(format!("{} → {} · {:.0}%", j.disk, j.image, j.frac * 100.0), Style::new().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::default());
+    }
     if let Some(d) = disk {
         lines.push(Line::from(vec![
             Span::styled("Image size  ", Style::new().fg(DIM)),
@@ -905,7 +1158,7 @@ fn draw_health(
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = modal_block(f, area, 74, 28, "Help", ACCENT);
+    let inner = modal_block(f, area, 74, 29, "Help", ACCENT);
     let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(format!("  {:<10}", k), Style::new().fg(ACCENT_SOFT).bold()),
@@ -926,6 +1179,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("a", "automatic backups — schedule a Task Scheduler job for the disk"),
         key("m", "manage: drive letters, volume label, online/offline, eject, read-only"),
         key("Shift+U", "install an available update / toggle auto-update on launch"),
+        key("Shift+B", "backups panel: running jobs (x stop), schedule (p pause), resumable images"),
         key("r", "rescan disks"),
         key("c", "copy the full session log to the clipboard (bug reports)"),
         key("u", "toggle safety override — allow protected disks (DANGEROUS)"),
@@ -1043,10 +1297,11 @@ fn draw_update(
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_schedule(f: &mut Frame, area: Rect, s: &Schedule, field: usize, installed: bool) {
+fn draw_schedule(f: &mut Frame, area: Rect, app: &App, s: &Schedule, field: usize, installed: bool) {
     let fields = schedule_fields(s);
-    let h = 14 + fields.len() as u16;
+    let h = 15 + fields.len() as u16;
     let inner = modal_block(f, area, 78, h, "Automatic backup — Windows Task Scheduler", ACCENT);
+    let pause = app.config.schedule.as_ref().and_then(|sc| sc.pause_text(jobs::now_unix()));
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("Disk         ", Style::new().fg(DIM)),
@@ -1072,6 +1327,15 @@ fn draw_schedule(f: &mut Frame, area: Rect, s: &Schedule, field: usize, installe
             "   runs elevated while you are logged on, even if this app is closed",
             Style::new().fg(DIM),
         ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Status       ", Style::new().fg(DIM)),
+        match &pause {
+            Some(t) => Span::styled(format!("⏸ {t}"), Style::new().fg(WARN_C).bold()),
+            None if installed => Span::styled("active", Style::new().fg(OK_C)),
+            None => Span::styled("—", Style::new().fg(DIM)),
+        },
+        Span::styled("   (p to pause or resume)", Style::new().fg(DIM)),
     ]));
     lines.push(Line::default());
     for (i, fld) in fields.iter().enumerate() {
@@ -1100,7 +1364,7 @@ fn draw_schedule(f: &mut Frame, area: Rect, s: &Schedule, field: usize, installe
     ]));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        "↑↓ row · ←→ change · Enter save & register task · n destination · x remove schedule · Esc cancel",
+        "↑↓ row · ←→ change · Enter save & register · n destination · p pause · x remove schedule · Esc cancel",
         Style::new().fg(DIM),
     )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -1151,4 +1415,75 @@ fn draw_manage_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
         Style::new().fg(DIM),
     )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// The scheduled-backup status bar appears above the footer with the
+    /// percentage, disk, image, detail and the Shift+B hint.
+    #[test]
+    fn sched_status_bar_renders() {
+        let mut app = App::new();
+        app.jobs = vec![jobs::Job {
+            pid: 1,
+            kind: jobs::Kind::Scheduled,
+            disk: "disk 2 (Samsung T7, 1.0 TB)".into(),
+            image: r"Z:\backups\auto.img".into(),
+            frac: 0.37,
+            detail: "backup 410 MB/s".into(),
+            started: 0,
+            updated: 0,
+        }];
+        let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row = |y: u16| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        let bar = row(22);
+        assert!(bar.contains("⏱"), "{bar}");
+        assert!(bar.contains("37%"), "{bar}");
+        assert!(bar.contains("Samsung T7"), "{bar}");
+        assert!(bar.contains("auto.img"), "{bar}");
+        assert!(bar.contains("scheduled backup"), "{bar}");
+        assert!(bar.contains("Shift+B"), "{bar}");
+        assert!(row(23).contains("select"), "footer: {}", row(23));
+
+        // the Backups panel lists the job, the stop hint and the schedule section
+        app.modal = Modal::Backups { idx: 0 };
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let all: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+            .collect();
+        assert!(all.contains("Running now"), "{all}");
+        assert!(all.contains("pid 1"), "{all}");
+        assert!(all.contains("x stop it"), "{all}");
+        assert!(all.contains("Schedule"), "{all}");
+        // pause menu lists the options and the current state
+        app.config.schedule = Some(crate::config::Schedule {
+            disk_name: "T7".into(),
+            paused_until: Some(crate::config::PAUSED_INDEFINITELY),
+            ..Default::default()
+        });
+        app.modal = Modal::PauseMenu { idx: 0, from_editor: false };
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let all: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "
+")
+            .collect();
+        assert!(all.contains("Resume scheduled backups now"), "{all}");
+        assert!(all.contains("Pause for 7 days"), "{all}");
+        assert!(all.contains("paused until you resume it"), "{all}");
+        app.modal = Modal::None;
+
+        app.jobs.clear();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let last = (0..buf.area.width).map(|x| buf[(x, 23)].symbol().to_string()).collect::<String>();
+        assert!(last.contains("select") && !last.contains("backup panel"));
+    }
 }

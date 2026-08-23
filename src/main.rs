@@ -5,7 +5,9 @@ mod app;
 mod bench;
 mod config;
 mod disks;
+mod jobs;
 mod logger;
+mod notify;
 mod ops;
 mod schedule;
 mod ui;
@@ -46,12 +48,26 @@ fn main() -> anyhow::Result<()> {
     // `diskutility --scheduled-backup` — headless run launched by the
     // Task Scheduler job registered with the `a` key.
     if std::env::args().any(|a| a == schedule::CLI_FLAG) {
+        let notify = config::load().notify;
         return match schedule::run_headless() {
-            Ok(msg) => {
+            Ok(schedule::Outcome::Skipped(msg)) => {
                 println!("{msg}");
                 Ok(())
             }
-            Err(e) => anyhow::bail!("scheduled backup failed: {e}"),
+            Ok(schedule::Outcome::Done(msg)) => {
+                println!("{msg}");
+                if notify {
+                    notify::toast("Scheduled backup finished", &msg);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if notify {
+                    let title = if e.starts_with("cancelled") { "Scheduled backup stopped" } else { "Scheduled backup FAILED" };
+                    notify::toast(title, &e);
+                }
+                anyhow::bail!("scheduled backup failed: {e}")
+            }
         };
     }
 

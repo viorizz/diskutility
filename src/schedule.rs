@@ -10,11 +10,13 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
 use crate::app::AppEvent;
 use crate::config::{self, Frequency, Schedule};
 use crate::disks::{self, Disk};
+use crate::jobs;
 use crate::logger;
 use crate::ops::{self, OpEvent};
 
@@ -147,9 +149,21 @@ fn prune(s: &Schedule, dir: &std::path::Path) {
 /// Headless entry point for the task: find the disk by identity, image it
 /// into the scheduled folder, then prune old images. Prints progress to
 /// stdout (visible if run by hand) and logs everything.
-pub fn run_headless() -> Result<String, String> {
+/// Result of a headless run that did not fail.
+pub enum Outcome {
+    /// A backup was written (message for the console + notification).
+    Done(String),
+    /// Nothing was done on purpose (paused); no notification.
+    Skipped(String),
+}
+
+pub fn run_headless() -> Result<Outcome, String> {
     let cfg = config::load();
     let s = cfg.schedule.ok_or("no schedule in config.json — set one up with the a key in the TUI")?;
+    if let Some(p) = s.pause_text(jobs::now_unix()) {
+        logger::log(format!("scheduled backup: skipped — {p}"));
+        return Ok(Outcome::Skipped(format!("scheduled backup is {p} — nothing was done")));
+    }
     logger::log(format!(
         "scheduled backup: start — disk '{}' serial {} ({}) → {} · {}",
         s.disk_name,
@@ -160,6 +174,19 @@ pub fn run_headless() -> Result<String, String> {
     ));
     if !ops::is_elevated() {
         return Err("scheduled backup needs administrator rights (the task should have RunLevel HIGHEST)".into());
+    }
+    // Only one backup at a time: a 2 TB image over the network takes hours
+    // while the trigger may fire every few minutes. Task Scheduler itself
+    // skips overlapping instances, but a manual run must not double up.
+    if let Some(running) = jobs::others().into_iter().next() {
+        return Err(format!(
+            "a {} backup is already running (pid {}, {} → {}, {:.0}%) — this run was skipped",
+            running.kind.label(),
+            running.pid,
+            running.disk,
+            running.image,
+            running.frac * 100.0
+        ));
     }
     let list = disks::enumerate().map_err(|e| format!("disk scan failed: {e}"))?;
     let disk = list
@@ -180,29 +207,61 @@ pub fn run_headless() -> Result<String, String> {
     if !dir.is_dir() {
         return Err(format!("backup folder not reachable: {}", s.dest_dir));
     }
+    // An interrupted image of this disk in the folder is continued rather
+    // than started over, so only the remainder needs free space.
+    let resume = ops::find_resumable(dir, &disk);
+    let needed = disk.size - resume.as_ref().map_or(0, |r| r.done);
     if let Some(free) = ops::free_space(&dir.join("x")) {
-        if free < disk.size {
+        if free < needed {
             // make room first if retention allows, then re-check
             prune(&s, dir);
             let free = ops::free_space(&dir.join("x")).unwrap_or(0);
-            if free < disk.size {
+            if free < needed {
                 return Err(format!(
                     "not enough free space in {}: {} available, {} needed",
                     s.dest_dir,
                     disks::human(free),
-                    disks::human(disk.size)
+                    disks::human(needed)
                 ));
             }
         }
     }
-    let path = dir.join(image_name(&disk));
-    println!("diskutility: backing up disk {} ({}) → {}", disk.number, disk.name, path.display());
+    let path = match &resume {
+        Some(r) => {
+            logger::log(format!(
+                "scheduled backup: resuming {} ({} of {} already saved)",
+                r.path.display(),
+                disks::human(r.done),
+                disks::human(disk.size)
+            ));
+            println!(
+                "diskutility: resuming backup of disk {} ({}) → {} from {}",
+                disk.number,
+                disk.name,
+                r.path.display(),
+                disks::human(r.done)
+            );
+            r.path.clone()
+        }
+        None => {
+            let p = dir.join(image_name(&disk));
+            println!("diskutility: backing up disk {} ({}) → {}", disk.number, disk.name, p.display());
+            p
+        }
+    };
     let (tx, rx) = mpsc::channel::<AppEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
-    ops::spawn_backup(tx, disk, path, cancel);
+    let start_frac = resume.as_ref().map_or(0.0, |r| r.done as f64 / disk.size.max(1) as f64);
+    let mut job = jobs::Publisher::start(jobs::Kind::Scheduled, &disk, &path, start_frac);
+    ops::spawn_backup(tx, disk, path, cancel.clone());
     let mut last_pct = -1i64;
     let result = loop {
-        match rx.recv() {
+        if !cancel.load(Ordering::Relaxed) && job.cancel_requested() {
+            cancel.store(true, Ordering::Relaxed);
+            job.mark_cancelling();
+            println!("  cancel requested — stopping");
+        }
+        match rx.recv_timeout(jobs::HEARTBEAT) {
             Ok(AppEvent::Op(OpEvent::Log(l))) => {
                 logger::log(format!("op: {l}"));
                 println!("  {l}");
@@ -213,11 +272,16 @@ pub fn run_headless() -> Result<String, String> {
                     last_pct = pct;
                     println!("  {pct:>3}%  {detail}");
                 }
+                job.update(frac, &detail);
             }
             Ok(AppEvent::Op(OpEvent::Done(r))) => break r,
             Ok(_) => {}
-            Err(_) => break Err("backup worker exited without reporting a result".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err("backup worker exited without reporting a result".into())
+            }
         }
+        job.heartbeat();
     };
     match &result {
         Ok(m) => {
@@ -226,7 +290,7 @@ pub fn run_headless() -> Result<String, String> {
         }
         Err(e) => logger::log(format!("scheduled backup FAILED: {e}")),
     }
-    result
+    result.map(Outcome::Done)
 }
 
 #[cfg(test)]

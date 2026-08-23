@@ -92,7 +92,30 @@ script, `diskutility --update` does the same.
   numbers shift), images go to your saved backup destination (`n`) as
   `auto-<disk>-<serial>-<timestamp>.img`, and older images beyond the *keep*
   count are pruned. If the disk is not connected at run time, nothing happens
-  and the log says so.
+  and the log says so. When a run finishes, fails or is stopped, a Windows
+  notification tells you the outcome (`"notify": false` in `config.json`
+  turns it off).
+- **Backups panel** (`Shift+B`) — every backup currently running, whether it
+  is the scheduled job in its hidden process or a manual one in another
+  diskutility window: disk, image, a progress gauge, speed, ETA, elapsed time
+  and pid. Select one and press `x` to stop it. The panel also shows the
+  registered schedule and any interrupted images waiting to be resumed. While
+  a background backup runs, a one-line status bar with the gauge sits above
+  the footer. Backups never overlap by accident: the scheduled job skips its
+  run while another backup is live, and the `s` menu warns you and asks for
+  confirmation before starting a second one.
+- **Pause scheduled backups** (`p` in the Backups panel or in the schedule
+  editor) — for 1 hour, 6 hours, 24 hours, 7 days, or until you resume them.
+  The task stays registered; each run just exits without doing anything until
+  the pause lifts. Handy when the NAS is full or you are about to unplug the
+  disk. A backup already running is not affected.
+- **Resumable backups** — an image is written as `name.img.partial` and only
+  renamed to `name.img` once complete, so a `.img` file is always a finished
+  backup. If a backup is stopped (`x` in the panel, Esc, a crash, a reboot), the next
+  backup of the same disk into the same folder — scheduled or manual —
+  continues from where it left off instead of starting over. The earlier part
+  reflects the disk as it was then, so resume only makes sense for a disk you
+  are not writing to in between.
 
 ## Safety
 
