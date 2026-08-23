@@ -704,8 +704,8 @@ checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
 
 [[package]]
 name = "utility-core"
-version = "0.1.0"
-source = "git+https://github.com/viorizz/utility-core?tag=v0.1.0#23908b979dde5efd1931f21be380c47180d1f29a"
+version = "0.1.1"
+source = "git+https://github.com/viorizz/utility-core?tag=v0.1.1#e5185403e26bf6965bc5d9150b4a5a6fd3341ca1"
 dependencies = [
  "base64",
  "chrono",

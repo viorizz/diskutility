@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn publish_list_cancel_and_stale() {
-        utility_core::init(&crate::APP);
+        utility_core::register(&crate::APP);
         let tmp = std::env::temp_dir().join(format!("du-jobs-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("diskutility")).unwrap();

@@ -1336,7 +1336,7 @@ mod tests {
     /// percentage, disk, image, detail and the Shift+B hint.
     #[test]
     fn sched_status_bar_renders() {
-        utility_core::init(&crate::APP);
+        utility_core::register(&crate::APP);
         let mut app = App::new();
         app.jobs = vec![jobs::Job {
             pid: 1,
