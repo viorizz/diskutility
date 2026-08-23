@@ -81,6 +81,25 @@ fn main() -> anyhow::Result<()> {
         };
     }
 
+    // `diskutility --hex <disk> [sector]` — dump one 512-byte sector and exit.
+    if let Some(i) = args.iter().position(|a| a == "--hex") {
+        let n: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("usage: diskutility --hex <disk number> [sector]"))?;
+        let lba: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let data = ops::read_raw(n, lba * 512 / 4096 * 4096, 4096).map_err(|e| anyhow::anyhow!(e))?;
+        let start = (lba * 512 % 4096) as usize;
+        let sector = data.get(start..start + 512).ok_or_else(|| anyhow::anyhow!("short read"))?;
+        println!("disk {n} sector {lba} (byte offset {})", lba * 512);
+        for (r, chunk) in sector.chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let ascii: String = chunk.iter().map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' }).collect();
+            println!("{:04x}  {}  {}", r * 16, hex.join(" "), ascii);
+        }
+        return Ok(());
+    }
+
     // Non-interactive mode for quick checks / scripting: `diskutility --list`
     if std::env::args().any(|a| a == "--list" || a == "-l") {
         return list_disks();

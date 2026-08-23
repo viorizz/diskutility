@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Padding, Paragra
 use ratatui::Frame;
 use utility_core::ui::{draw_footer as core_footer, draw_header as core_header, modal_block, spinner, HeaderStatus, Hint, Theme};
 
-use crate::app::{pause_options, schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
+use crate::app::{HexView, pause_options, schedule_fields, schedule_value, App, InputPurpose, Modal, PendingAction, ProgressState};
 use crate::config::Schedule;
 use crate::jobs;
 use crate::disks::{fit, human, Disk};
@@ -53,6 +53,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Modal::EraseMenu { idx } => draw_erase_menu(f, area, *idx),
         Modal::TestMenu { idx } => draw_test_menu(f, area, *idx),
         Modal::Health { title, report } => draw_health(f, area, app, title, report.as_ref()),
+        Modal::Hex(v) => draw_hex(f, area, v),
         Modal::BackupMenu { idx } => draw_backup_menu(f, area, app, *idx),
         Modal::Input { purpose, buf } => draw_input(f, area, app, purpose, buf),
         Modal::Confirm { action, buf } => draw_confirm(f, area, app, action, buf),
@@ -495,6 +496,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ("m", "manage"),
         ("b", "test"),
         ("h", "health"),
+        ("x", "hex"),
         ("r", "rescan"),
         ("c", "log"),
         ("u", if app.unlocked { "re-lock" } else { "override" }),
@@ -709,6 +711,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, purpose: &InputPurpose, buf:
         InputPurpose::VolumeLabel { letter } => (
             format!("New label for volume {letter}:"),
             "up to 32 characters (11 on FAT32)   ·   Enter apply · Esc cancel",
+        ),
+        InputPurpose::GotoLba(v) => (
+            format!("Go to sector — disk {} has {} sectors", v.disk, v.sectors),
+            "sector number (decimal or 0x hex) or a byte offset like 1.5G / 512M   ·   Enter go · Esc back",
         ),
     };
     let extra = match purpose {
@@ -1086,7 +1092,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("n", "set a network drive / folder as the default backup destination"),
         key("d", "clone the disk sector-for-sector onto another disk (verified)"),
         key("a", "automatic backups — schedule a Task Scheduler job for the disk"),
-        key("m", "manage: drive letters, volume label, online/offline, eject, read-only"),
+        key("m", "manage: drive letters, volume label, online/offline, eject, read-only, new signature"),
+        key("x", "hex sector viewer (read-only): ←→ sector, PgUp/PgDn ±256, g go to, Home/End"),
         key("Shift+U", "install an available update / toggle auto-update on launch"),
         key("Shift+B", "backups panel: running jobs (x stop), schedule (p pause), resumable images"),
         key("r", "rescan disks"),
@@ -1326,11 +1333,143 @@ fn draw_manage_menu(f: &mut Frame, area: Rect, app: &App, idx: usize) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+// ---------------------------------------------------------------------------
+// Hex sector viewer
+// ---------------------------------------------------------------------------
+
+fn draw_hex(f: &mut Frame, area: Rect, v: &HexView) {
+    let title = format!("Sector {} of {} — disk {} · {}", v.lba, v.sectors, v.disk, fit(&v.name, 28));
+    // 32 rows of 16 bytes + header + footer; shrink on small terminals and scroll.
+    let want_h = 32 + 8;
+    let inner = modal_block(f, area, 84, want_h as u16, &title, ACCENT);
+    let rows_avail = inner.height.saturating_sub(3) as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(format!("byte offset {:>16}   ", v.lba * crate::app::SECTOR), Style::new().fg(DIM)),
+        Span::styled(
+            format!("{:>5.1}%", v.lba as f64 * 100.0 / v.sectors.max(1) as f64),
+            Style::new().fg(DIM),
+        ),
+        Span::styled(describe_sector(v), Style::new().fg(ACCENT_SOFT)),
+    ]));
+    match &v.data {
+        Err(e) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(e.clone(), Style::new().fg(ERR_C))));
+        }
+        Ok(data) => {
+            let first = v.row.min(32usize.saturating_sub(rows_avail));
+            for r in first..32.min(first + rows_avail) {
+                let chunk = &data[r * 16..(r + 1) * 16];
+                let mut spans = vec![Span::styled(format!("{:04x}  ", r * 16), Style::new().fg(DIM))];
+                for (i, b) in chunk.iter().enumerate() {
+                    let style = if *b == 0 {
+                        Style::new().fg(DIM)
+                    } else if b.is_ascii_graphic() || *b == b' ' {
+                        Style::new().fg(TEXT)
+                    } else {
+                        Style::new().fg(ACCENT_SOFT)
+                    };
+                    spans.push(Span::styled(format!("{b:02x}"), style));
+                    spans.push(Span::raw(if i == 7 { "  " } else { " " }));
+                }
+                spans.push(Span::raw(" "));
+                let ascii: String = chunk.iter().map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '·' }).collect();
+                spans.push(Span::styled(ascii, Style::new().fg(OK_C)));
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    let key = |k: &'static str| Span::styled(k, Style::new().fg(ACCENT_SOFT).bold());
+    let txt = |t: &'static str| Span::styled(t, Style::new().fg(DIM));
+    lines.push(Line::from(vec![
+        key("←→"), txt(" sector · "), key("PgUp/PgDn"), txt(" ±256 · "), key("Home/End"), txt(" · "),
+        key("↑↓"), txt(" scroll · "), key("g"), txt(" go to · "), key("Esc"), txt(" close   (read-only)"),
+    ]));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// What a well-known sector looks like: MBR / GPT header / FAT / NTFS boot
+/// sectors, or blank.
+fn describe_sector(v: &HexView) -> String {
+    let Ok(d) = &v.data else { return String::new() };
+    if d.iter().all(|b| *b == 0) {
+        return "   all zeros".into();
+    }
+    if d.len() >= 512 && v.lba == 0 && d[510] == 0x55 && d[511] == 0xaa {
+        return if d[0x1c2] == 0xee { "   protective MBR (GPT disk)".into() } else { "   MBR boot sector".into() };
+    }
+    if d.starts_with(b"EFI PART") {
+        return "   GPT header".into();
+    }
+    if d.len() >= 11 && &d[3..11] == b"NTFS    " {
+        return "   NTFS boot sector".into();
+    }
+    if d.len() >= 11 && &d[3..11] == b"EXFAT   " {
+        return "   exFAT boot sector".into();
+    }
+    if d.len() >= 90 && (&d[0x52..0x57] == b"FAT32" || &d[0x36..0x3b] == b"FAT16" || &d[0x36..0x3b] == b"FAT12") {
+        return "   FAT boot sector".into();
+    }
+    if d.len() >= 512 && d[510] == 0x55 && d[511] == 0xaa {
+        return "   boot signature 55 AA".into();
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn mbr() -> Vec<u8> {
+        let mut d = vec![0u8; 512];
+        d[0x1c2] = 0xee;
+        d[510] = 0x55;
+        d[511] = 0xaa;
+        d[0..4].copy_from_slice(b"BOOT");
+        d
+    }
+
+    #[test]
+    fn hex_viewer_recognises_sectors_and_renders() {
+        let mut v = HexView { disk: 1, name: "WD BLACK".into(), sectors: 4096, lba: 0, data: Ok(mbr()), row: 0 };
+        assert_eq!(describe_sector(&v).trim(), "protective MBR (GPT disk)");
+        v.lba = 1;
+        let mut gpt = vec![0u8; 512];
+        gpt[..8].copy_from_slice(b"EFI PART");
+        v.data = Ok(gpt);
+        assert_eq!(describe_sector(&v).trim(), "GPT header");
+        v.data = Ok(vec![0u8; 512]);
+        assert_eq!(describe_sector(&v).trim(), "all zeros");
+        let mut ntfs = vec![0u8; 512];
+        ntfs[3..11].copy_from_slice(b"NTFS    ");
+        v.data = Ok(ntfs);
+        assert_eq!(describe_sector(&v).trim(), "NTFS boot sector");
+
+        v.lba = 0;
+        v.data = Ok(mbr());
+        let mut term = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        term.draw(|f| draw_hex(f, f.area(), &v)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Sector 0 of 4096"), "{text}");
+        assert!(text.contains("42 4f 4f 54"), "first bytes in hex: {text}");
+        assert!(text.contains("BOOT"), "ascii column");
+        assert!(text.contains("01f0"), "last row offset");
+
+        // Small terminal: scrolls instead of overflowing.
+        v.row = 31;
+        let mut small = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        small.draw(|f| draw_hex(f, f.area(), &v)).unwrap();
+        let text: String = small.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("01f0") && !text.contains("0000  "), "{text}");
+
+        v.data = Err("cannot open".into());
+        term.draw(|f| draw_hex(f, f.area(), &v)).unwrap();
+    }
 
     /// The scheduled-backup status bar appears above the footer with the
     /// percentage, disk, image, detail and the Shift+B hint.

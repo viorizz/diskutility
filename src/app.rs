@@ -137,6 +137,60 @@ pub enum InputPurpose {
     DriveLetter { partition: u32, free: Vec<char> },
     /// New label for the volume at `letter` (`m` menu).
     VolumeLabel { letter: char },
+    /// Jump to a sector in the hex viewer (`g`); returns to the view.
+    GotoLba(HexView),
+}
+
+/// State of the hex sector viewer.
+#[derive(Debug, Clone)]
+pub struct HexView {
+    pub disk: u32,
+    pub name: String,
+    /// Total sectors (512-byte units).
+    pub sectors: u64,
+    pub lba: u64,
+    /// The 512 bytes at `lba`, or why they could not be read.
+    pub data: Result<Vec<u8>, String>,
+    /// First of the 32 rows shown (for small terminals).
+    pub row: usize,
+}
+
+pub const SECTOR: u64 = 512;
+
+impl HexView {
+    pub fn open(disk: &Disk, lba: u64) -> HexView {
+        let sectors = (disk.size / SECTOR).max(1);
+        let mut v = HexView { disk: disk.number, name: disk.name.clone(), sectors, lba: 0, data: Ok(Vec::new()), row: 0 };
+        v.goto(lba);
+        v
+    }
+
+    /// Read the sector; raw device reads must be 4 KiB-aligned, so fetch the
+    /// surrounding 4 KiB block and slice.
+    pub fn goto(&mut self, lba: u64) {
+        self.lba = lba.min(self.sectors.saturating_sub(1));
+        self.row = 0;
+        let byte = self.lba * SECTOR;
+        let block = byte / 4096 * 4096;
+        self.data = ops::read_raw(self.disk, block, 4096).and_then(|b| {
+            let start = (byte - block) as usize;
+            if b.len() < start + SECTOR as usize {
+                Err(format!("short read at LBA {} ({} bytes)", self.lba, b.len()))
+            } else {
+                Ok(b[start..start + SECTOR as usize].to_vec())
+            }
+        });
+        if let Err(e) = &self.data {
+            logger::log(format!("hex: disk {} lba {}: {e}", self.disk, self.lba));
+        }
+    }
+
+    pub fn step(&mut self, delta: i64) {
+        let next = (self.lba as i64 + delta).clamp(0, self.sectors.saturating_sub(1) as i64) as u64;
+        if next != self.lba {
+            self.goto(next);
+        }
+    }
 }
 
 /// One row of the manage menu (`m`).
@@ -161,6 +215,7 @@ impl ManageItem {
             ManageItem::Op(ManageOp::Offline) => "Take the disk offline (unmount everything, keep data)".into(),
             ManageItem::Op(ManageOp::Eject { .. }) => "Safely eject (flush and prepare for unplugging)".into(),
             ManageItem::Op(ManageOp::ClearReadOnly) => "Clear the read-only flag".into(),
+            ManageItem::Op(ManageOp::NewSignature) => "New disk signature / GUID (after a clone, so Windows stops keeping it offline)".into(),
             ManageItem::Op(op) => op.title(0),
         }
     }
@@ -256,6 +311,8 @@ pub enum Modal {
     /// Where should the backup image go? Entries come from `App::backup_choices`.
     BackupMenu { idx: usize },
     Health { title: String, report: Option<Result<ops::HealthReport, String>> },
+    /// `x`: read-only hex view of one 512-byte sector of the selected disk.
+    Hex(HexView),
     Input { purpose: InputPurpose, buf: String },
     Confirm { action: PendingAction, buf: String },
     Progress(ProgressState),
@@ -1053,8 +1110,32 @@ impl App {
                 }
                 _ => self.modal = Modal::Health { title, report },
             },
+            Modal::Hex(mut v) => {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => return,
+                    KeyCode::Left | KeyCode::Char('h') => v.step(-1),
+                    KeyCode::Right | KeyCode::Char('l') => v.step(1),
+                    KeyCode::PageUp => v.step(-256),
+                    KeyCode::PageDown => v.step(256),
+                    KeyCode::Home => v.goto(0),
+                    KeyCode::End => v.goto(v.sectors.saturating_sub(1)),
+                    KeyCode::Up => v.row = v.row.saturating_sub(1),
+                    KeyCode::Down => v.row = (v.row + 1).min(31),
+                    KeyCode::Char('g') => {
+                        self.modal = Modal::Input { purpose: InputPurpose::GotoLba(v), buf: String::new() };
+                        return;
+                    }
+                    KeyCode::Char('c') => self.copy_log(),
+                    _ => {}
+                }
+                self.modal = Modal::Hex(v);
+            }
             Modal::Input { purpose, mut buf } => match k.code {
-                KeyCode::Esc => {}
+                KeyCode::Esc => {
+                    if let InputPurpose::GotoLba(v) = purpose {
+                        self.modal = Modal::Hex(v);
+                    }
+                }
                 KeyCode::Backspace => {
                     buf.pop();
                     self.modal = Modal::Input { purpose, buf };
@@ -1117,6 +1198,28 @@ impl App {
                             _ => {
                                 self.error("type a single letter, e.g. E");
                                 self.modal = Modal::Input { purpose: InputPurpose::DriveLetter { partition, free }, buf };
+                            }
+                        }
+                    }
+                    InputPurpose::GotoLba(mut v) => {
+                        let s = buf.trim().to_ascii_lowercase();
+                        let parsed = if let Some(h) = s.strip_prefix("0x") {
+                            u64::from_str_radix(h, 16).ok()
+                        } else if let Some(g) = s.strip_suffix('g') {
+                            g.parse::<f64>().ok().map(|x| (x * 1024.0 * 1024.0 * 1024.0 / SECTOR as f64) as u64)
+                        } else if let Some(m) = s.strip_suffix('m') {
+                            m.parse::<f64>().ok().map(|x| (x * 1024.0 * 1024.0 / SECTOR as f64) as u64)
+                        } else {
+                            s.parse::<u64>().ok()
+                        };
+                        match parsed {
+                            Some(lba) => {
+                                v.goto(lba);
+                                self.modal = Modal::Hex(v);
+                            }
+                            None => {
+                                self.error("type a sector number (decimal or 0x hex), or an offset like 1.5G / 512M");
+                                self.modal = Modal::Input { purpose: InputPurpose::GotoLba(v), buf };
                             }
                         }
                     }
@@ -1367,6 +1470,13 @@ impl App {
                     self.error("no disk selected");
                 }
             }
+            KeyCode::Char('x') => {
+                if let Some(disk) = self.selected_disk() {
+                    self.modal = Modal::Hex(HexView::open(disk, 0));
+                } else {
+                    self.error("no disk selected");
+                }
+            }
             KeyCode::Char('h') => {
                 if let Some(disk) = self.selected_disk() {
                     let title = format!("Health — disk {} · {}", disk.number, disk.name);
@@ -1426,6 +1536,9 @@ impl App {
         }
         let letter = d.partitions.iter().find_map(|p| p.letter.chars().next());
         v.push(ManageItem::Op(ManageOp::Eject { letter }));
+        if d.style == "GPT" || d.style == "MBR" {
+            v.push(ManageItem::Op(ManageOp::NewSignature));
+        }
         v
     }
 

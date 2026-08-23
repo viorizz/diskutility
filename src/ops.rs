@@ -937,7 +937,7 @@ pub fn spawn_clone(
                 target.number
             ));
             Ok(format!(
-                "Cloned disk {} → disk {} ({}) in {}. If Windows keeps the clone offline because its signature collides with the source, unplug the source or online it in Disk Management.",
+                "Cloned disk {} → disk {} ({}) in {}. If Windows keeps the clone offline because its signature collides with the source, give it a new one: m → New disk signature.",
                 source.number,
                 target.number,
                 human(total),
@@ -1033,6 +1033,10 @@ pub enum ManageOp {
     /// to taking the disk offline when no volume has a letter.
     Eject { letter: Option<char> },
     ClearReadOnly,
+    /// Give the disk a fresh MBR signature / GPT disk GUID (diskpart
+    /// `uniqueid`). Needed after a clone: Windows keeps a disk whose
+    /// signature collides with another one offline.
+    NewSignature,
 }
 
 impl ManageOp {
@@ -1045,6 +1049,7 @@ impl ManageOp {
             ManageOp::Offline => format!("Disk {disk} · taking offline"),
             ManageOp::Eject { .. } => format!("Disk {disk} · safely ejecting"),
             ManageOp::ClearReadOnly => format!("Disk {disk} · clearing read-only flag"),
+            ManageOp::NewSignature => format!("Disk {disk} · new disk signature"),
         }
     }
 
@@ -1089,9 +1094,44 @@ impl ManageOp {
                  if ($d.IsReadOnly) { throw 'still read-only after Set-Disk — the device itself may be write-protected (see the format prep diagnostics, or check for a lock switch / enclosure fault)' }\n\
                  Write-Output 'read-only flag cleared'"
                 .into(),
+            ManageOp::NewSignature => r#"$d = Get-Disk -Number $n
+if ($d.PartitionStyle -eq 'GPT') { $id = [guid]::NewGuid().ToString() }
+elseif ($d.PartitionStyle -eq 'MBR') { $id = '{0:X8}' -f (Get-Random -Minimum 1 -Maximum 2147483647) }
+else { throw 'the disk has no partition table (RAW) - there is no signature to regenerate' }
+Write-Output "old id: $($d.Guid)$('{0:X8}' -f [int64]$d.Signature)"
+$dp = (@("select disk $n", "uniqueid disk id=$id") | & "$env:SystemRoot\System32\diskpart.exe" | Out-String)
+($dp -split "`n" | Where-Object { $_ -match 'disk' -and $_ -notmatch 'Copyright|Microsoft|On computer' }) | ForEach-Object { Write-Output $_.Trim() }
+Start-Sleep -Milliseconds 400
+Update-HostStorageCache
+$d = Get-Disk -Number $n
+$after = "$($d.Guid)$('{0:X8}' -f [int64]$d.Signature)"
+if ($after -notlike "*$id*") { throw "diskpart did not apply the new id (now $after): $($dp.Trim())" }
+Write-Output "new disk signature applied: $id""#
+                .into(),
         }
         .replace("$n", &n.to_string())
     }
+}
+
+/// Read `len` bytes at byte offset `offset` from the raw disk, read-only.
+/// Raw reads must be sector-aligned, so callers pass multiples of 4096.
+pub fn read_raw(n: u32, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .open(format!(r"\\.\PHYSICALDRIVE{n}"))
+        .map_err(|e| format!(r"cannot open \\.\PHYSICALDRIVE{n} for reading: {e} — an elevated (administrator) terminal is required"))?;
+    f.seek(SeekFrom::Start(offset)).map_err(|e| format!("seek failed: {e}"))?;
+    let mut buf = vec![0u8; len];
+    let mut got = 0;
+    while got < len {
+        match f.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) => return Err(format!("read at {offset} failed: {e}")),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
 }
 
 /// Run a manage op: identity check first, then the short script. Narration

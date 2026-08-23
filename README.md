@@ -77,6 +77,10 @@ script, `diskutility --update` does the same.
   unreadable 4 KiB blocks.
 - **Health** (`h`) — SMART wear, temperature, power-on hours and error counts
   (needs an elevated terminal; USB bridges usually block passthrough).
+- **Hex viewer** (`x`) — read-only sector browser: `←` `→` step, `PgUp`/`PgDn`
+  jump 256 sectors, `g` goes to a sector or a byte offset (`1.5G`), and known
+  structures (MBR, GPT header, NTFS/exFAT/FAT boot sectors) are labelled.
+  `diskutility --hex <disk> [sector]` dumps one from the command line.
 - **Backup** (`s`) — full sector image of a disk to an `.img` file, with free
   space and same-disk checks. Restore it onto any disk with `i`.
 - **Clone** (`d`) — sector-for-sector disk-to-disk copy with the partition

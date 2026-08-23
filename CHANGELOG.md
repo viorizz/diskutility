@@ -6,6 +6,13 @@ body, so **every release must have its section here before the tag is pushed**
 (the workflow fails otherwise). GitHub's auto-generated "Full Changelog"
 comparison link is appended below these notes.
 
+## v0.4.9 — 2026-08-23
+
+### Added
+- **Hex sector viewer (`x`)** — read-only browser of the selected disk's sectors, 16 bytes per row with an ASCII column: `←`/`→` step one sector, `PgUp`/`PgDn` jump 256, `Home`/`End`, `↑`/`↓` scroll on small terminals, `g` goes to a sector number (decimal or `0x…`) or a byte offset such as `1.5G` / `512M`. Well-known sectors are labelled: MBR / protective MBR, GPT header, NTFS, exFAT and FAT boot sectors, all-zero. Reads go through the raw device 4 KiB-aligned, so 4Kn drives work too. Needs an elevated terminal like every raw read.
+- **`diskutility --hex <disk> [sector]`** — the same dump from the command line.
+- **New disk signature / GUID** in the manage menu (`m`) — after a clone, Windows keeps the copy offline because its MBR signature or GPT disk GUID collides with the source. This regenerates it through diskpart `uniqueid`, verifies the change, and the clone's success message now points at it. Goes through the same disk-identity check and protection rules as every manage action.
+
 ## v0.4.8 — 2026-08-23
 
 ### Changed
